@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mbo-lab"
+version = "0.1.0"
+description = "Databento DBN to Nautilus L3 order books"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "databento==0.86.0",
+    "databento-dbn==0.69.0",
+    "nautilus_trader==1.231.0",
+    "zstandard==0.25.0",
+]
+
+[project.scripts]
+mbo = "mbo_lab.cli:main"
+
+[dependency-groups]
+dev = [
+    "jupyterlab>=4.4",
+    "ipykernel>=6.30",
+    "nbclient>=0.10",
+    "ruff>=0.12",
+    "matplotlib>=3.11.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mbo_lab"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

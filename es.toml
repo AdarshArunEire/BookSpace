@@ -1,0 +1,5 @@
+dataset = "GLBX.MDP3"
+symbol = "ES.c.0"
+stype_in = "continuous"
+start = "2024-06-17T00:00:00Z"
+end = "2024-06-17T00:01:00Z"
