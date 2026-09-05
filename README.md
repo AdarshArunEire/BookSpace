@@ -125,5 +125,57 @@ MBO on receive time, and the pinned Nautilus decoder uses receive time for its e
 
 No Parquet catalog, server, simulator, or custom matching engine is included.
 
+## Paid historical downloads
+
+The download command requires two separate limits: `--max-cost` is a per-request
+ceiling, and the local append-only JSONL ledger is a cumulative ceiling. Before any
+new transfer, the command asks Databento for a quote, checks the remaining ledger
+budget, prints both, and requires the exact interactive word `DOWNLOAD`. There is no
+`--yes` bypass. The quoted amount is reserved in the ledger before the transfer;
+successful storage appends a `complete` record containing the same quoted USD amount.
+Failed or interrupted transfers keep their reservation so they cannot be retried
+without an explicit ledger review.
+
+Create the ledger once using the remaining credit and expiry shown in the Databento
+portal. Do not guess these values:
+
+```powershell
+python -m uv run mbo budget-init `
+  --ledger .local/databento-budget.jsonl `
+  --available-usd 125 `
+  --expires-on 2027-01-01
+$ledger = (Resolve-Path .local/databento-budget.jsonl).Path
+[Environment]::SetEnvironmentVariable("MBO_BUDGET_LEDGER", $ledger, "User")
+$env:MBO_BUDGET_LEDGER = $ledger
+python -m uv run mbo budget
+```
+
+Then quote and, only after reviewing the printed estimate, request data:
+
+```powershell
+uv run mbo download --config es.toml --max-cost 0.10
+```
+
+Type `DOWNLOAD` only when the quote and remaining ledger budget are acceptable.
+The current `es.toml` profile requests the continuous ES symbol `ES.c.0` from
+`2024-06-17T00:00:00Z` through `2024-06-17T00:01:00Z`: one minute beginning at
+weekday midnight UTC so the MBO stream includes the opening snapshot. The profile
+does not request current data.
+
+For a different date on the same ES profile, override both endpoints together:
+
+```powershell
+uv run mbo download --config es.toml --start 2024-06-24T00:00:00Z --end 2024-06-24T00:01:00Z --max-cost 0.10
+```
+
+The initial request validator requires a positive interval within one UTC day and a
+weekday midnight UTC start. The symbol and dataset still come from `es.toml`; choosing
+another instrument is a later CLI extension.
+
+The local ledger cannot account for usage from other tools, API keys or team members,
+and it cannot guarantee the provider's final bill. Set Databento's historical monthly
+limit in the portal to the amount you are willing to pay, ideally below the local
+budget, and monitor the provider's billing page as the authoritative record.
+
 SDK references: [Nautilus loader at the pinned version](https://github.com/nautechsystems/nautilus_trader/blob/v1.231.0/nautilus_trader/adapters/databento/loaders.py),
 [Databento snapshots](https://databento.com/docs/standards-and-conventions/mbo-snapshot).

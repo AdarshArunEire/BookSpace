@@ -83,25 +83,34 @@ def status(path=None):
             raise ValueError("Ledger limit exceeds $125")
         expiry = date.fromisoformat(header["expires_on"])
         reserved = Decimal("0")
+        reservations = {}
         ids = set()
         completed = set()
         for record in records[1:]:
             if record["type"] == "complete":
                 if record["id"] not in ids or record["id"] in completed:
                     raise ValueError("Invalid completion record")
+                if amount(record.get("usd")) != reservations[record["id"]]:
+                    raise ValueError("Completion amount does not match reservation")
                 completed.add(record["id"])
                 continue
             if record["type"] != "reserve" or record["id"] in ids:
                 raise ValueError("Invalid or duplicate reservation")
             ids.add(record["id"])
-            reserved += amount(record["usd"])
+            usd = amount(record["usd"])
+            reservations[record["id"]] = usd
+            reserved += usd
         if reserved > limit:
             raise ValueError("Ledger reservations exceed its limit")
+        completed_usd = sum(
+            (reservations[reservation_id] for reservation_id in completed), Decimal("0")
+        )
     except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
         raise ValueError(f"Budget ledger unavailable or corrupt: {path}: {exc}") from exc
     return {
         "ledger": str(path), "limit_usd": str(limit),
         "reserved_usd": str(reserved), "remaining_usd": str(limit - reserved),
+        "completed_usd": str(completed_usd), "pending_usd": str(reserved - completed_usd),
         "expires_on": expiry.isoformat(),
         "expired": expiry <= datetime.now(timezone.utc).date(),
     }
@@ -127,11 +136,13 @@ def reserve(cost, request, path=None):
     return {"ledger": str(path), **record}
 
 
-def complete(reservation):
+def complete(reservation, *, manifest_path=None):
     path = ledger_path(reservation["ledger"])
     with locked(path):
         status(path)
         append(path, {
             "type": "complete", "id": reservation["id"],
             "at": datetime.now(timezone.utc).isoformat(),
+            "usd": reservation["usd"],
+            "manifest": str(manifest_path) if manifest_path is not None else None,
         })

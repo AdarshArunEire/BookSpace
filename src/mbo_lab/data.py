@@ -1,4 +1,4 @@
-"""Small-file historical MBO loading. Network access is explicit and optional."""
+"""Historical MBO acquisition and local book reconstruction. Network access is explicit."""
 
 from __future__ import annotations
 
@@ -21,9 +21,10 @@ from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.enums import BookType
 
+from databento import Compression
+
 from mbo_lab.budget import complete, reserve, status
 
-MAX_DECODED_BYTES = 128 * 1024 * 1024
 
 
 class DataError(ValueError):
@@ -38,6 +39,15 @@ def _utc(value: str) -> datetime:
     if result.tzinfo is None or result.utcoffset() != timedelta(0):
         raise DataError("Request times must include UTC: use a trailing Z or +00:00")
     return result.astimezone(timezone.utc)
+
+
+def _iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resolution_end_date(end: datetime):
+    """Return the exclusive date needed to resolve every UTC date touched by [start, end)."""
+    return (end - timedelta(microseconds=1)).date() + timedelta(days=1)
 
 
 @dataclass(frozen=True)
@@ -61,10 +71,12 @@ class Request:
             raise DataError("stype_in must be raw_symbol, instrument_id, or continuous")
         if self.stype_in == "instrument_id" and not self.symbol.isdigit():
             raise DataError("instrument_id requests must use a numeric symbol")
-        if end <= start or start.date() != (end - timedelta(microseconds=1)).date():
-            raise DataError("Choose a positive interval within one UTC day")
-        if start.time().isoformat() != "00:00:00" or start.weekday() > 4:
-            raise DataError("Start at weekday 00:00:00Z to include the CME MBO snapshot")
+        if end <= start:
+            raise DataError("Choose a positive interval")
+        if start.time().isoformat() != "00:00:00":
+            raise DataError("Start at 00:00:00Z so the range can be partitioned at book reset boundaries")
+        object.__setattr__(self, "start", _iso_utc(start))
+        object.__setattr__(self, "end", _iso_utc(end))
 
     @classmethod
     def from_toml(cls, path: str | Path) -> Request:
@@ -91,47 +103,124 @@ def discover(dataset: str = "GLBX.MDP3", *, client=None) -> dict:
     }
 
 
-def resolve(request: Request, *, client) -> Request:
-    if request.stype_in in {"raw_symbol", "instrument_id"}:
-        return request
-    day = _utc(request.start).date()
+
+def _mapping_intervals(request: Request, *, client) -> list[tuple[datetime, datetime, str]]:
+    """Resolve a continuous symbol over the whole requested range, including roll boundaries."""
+    start, end = _utc(request.start), _utc(request.end)
     response = client.symbology.resolve(
         dataset=request.dataset,
         symbols=[request.symbol],
         stype_in=request.stype_in,
         stype_out="instrument_id",
-        start_date=day.isoformat(),
-        end_date=(day + timedelta(days=1)).isoformat(),
+        start_date=start.date().isoformat(),
+        end_date=_resolution_end_date(end).isoformat(),
     )
     try:
-        intervals = response["result"][request.symbol]
-        symbols = {
-            str(item["s"]) for item in intervals if item["d0"] <= day.isoformat() < item["d1"]
-        }
+        items = response["result"][request.symbol]
     except (KeyError, TypeError) as exc:
         raise DataError(f"Databento returned no usable mapping for {request.symbol}") from exc
-    if len(symbols) != 1:
-        raise DataError(f"Expected one dated contract for {request.symbol}: {response}")
-    return replace(request, symbol=symbols.pop(), stype_in="instrument_id")
+
+    intervals = []
+    for item in items:
+        try:
+            left = datetime.fromisoformat(str(item["d0"])).replace(tzinfo=timezone.utc)
+            right = datetime.fromisoformat(str(item["d1"])).replace(tzinfo=timezone.utc)
+            symbol = str(item["s"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DataError(f"Invalid symbology interval for {request.symbol}: {item!r}") from exc
+        left, right = max(left, start), min(right, end)
+        if left < right:
+            intervals.append((left, right, symbol))
+
+    intervals.sort(key=lambda item: item[0])
+    cursor = start
+    for left, right, _ in intervals:
+        if left > cursor:
+            raise DataError(f"Databento symbology has a gap beginning at {_iso_utc(cursor)}")
+        cursor = max(cursor, right)
+    if cursor < end:
+        raise DataError(f"Databento symbology does not cover the range through {_iso_utc(end)}")
+    return intervals
 
 
-def estimate(request: Request, *, client=None) -> dict:
+def _weekday_midnights(start: datetime, end: datetime) -> list[datetime]:
+    """UTC weekday midnights inside (start, end); CME historical MBO snapshots occur here."""
+    point = datetime.combine(start.date() + timedelta(days=1), datetime.min.time(), timezone.utc)
+    result = []
+    while point < end:
+        if point.weekday() <= 4:
+            result.append(point)
+        point += timedelta(days=1)
+    return result
+
+
+def plan(request: Request, *, client=None) -> list[Request]:
+    """Partition a range into independently reconstructible, single-instrument cache chunks."""
     client = client if client is not None else db.Historical()
-    resolved = resolve(request, client=client)
+    start, end = _utc(request.start), _utc(request.end)
+
+    if request.stype_in == "continuous":
+        mappings = _mapping_intervals(request, client=client)
+    else:
+        mappings = [(start, end, request.symbol)]
+
+    chunks = []
+    for left, right, symbol in mappings:
+        cuts = [left, *_weekday_midnights(left, right), right]
+        for chunk_start, chunk_end in zip(cuts, cuts[1:]):
+            if chunk_start >= chunk_end:
+                continue
+            chunks.append(
+                Request(
+                    symbol=symbol,
+                    start=_iso_utc(chunk_start),
+                    end=_iso_utc(chunk_end),
+                    dataset=request.dataset,
+                    stype_in="instrument_id" if request.stype_in == "continuous" else request.stype_in,
+                )
+            )
+    if not chunks:
+        raise DataError("The requested range produced no downloadable chunks")
+    return chunks
+
+
+def resolve(request: Request, *, client) -> Request:
+    """Resolve only when the full request maps to exactly one chunk; kept for callers/tests."""
+    chunks = plan(request, client=client)
+    if len(chunks) != 1:
+        raise DataError("Request spans multiple book/cache chunks; use plan() or estimate()")
+    return chunks[0]
+
+
+def _estimate_one(request: Request, *, client) -> dict:
     costs = {
-        schema: float(client.metadata.get_cost(**_parameters(resolved, schema)))
+        schema: float(client.metadata.get_cost(**_parameters(request, schema)))
         for schema in ("definition", "mbo")
     }
     if any(not math.isfinite(cost) or cost < 0 for cost in costs.values()):
         raise DataError("Provider returned an invalid cost estimate")
-    return {"request": asdict(resolved), "usd": costs, "total_usd": sum(costs.values())}
+    return {"request": asdict(request), "usd": costs, "total_usd": sum(costs.values())}
+
+
+def estimate(request: Request, *, client=None) -> dict:
+    client = client if client is not None else db.Historical()
+    quotes = [_estimate_one(chunk, client=client) for chunk in plan(request, client=client)]
+    costs = {
+        schema: sum(quote["usd"][schema] for quote in quotes)
+        for schema in ("definition", "mbo")
+    }
+    return {
+        "request": asdict(request),
+        "chunks": quotes,
+        "usd": costs,
+        "total_usd": sum(costs.values()),
+    }
 
 
 def _records(path: str | Path) -> Iterator:
     """Use SDK decoding, but also require complete Zstandard frames and DBN records."""
     path = Path(path)
-    decoder = dbn.DBNDecoder(compression=dbn.Compression.NONE)
-    total = 0
+    decoder = dbn.DBNDecoder(compression=Compression.NONE) # type: ignore # dbn.Compression.from_int(0) is the same but pylance won't be angry
     decompressor = None
     try:
         with path.open("rb") as stream:
@@ -142,19 +231,16 @@ def _records(path: str | Path) -> Iterator:
             while chunk := stream.read(65536):
                 while chunk:
                     if compressed:
+                        assert decompressor is not None
                         if decompressor.eof:
                             decompressor = zstd.ZstdDecompressor().decompressobj()
                         decoded = decompressor.decompress(chunk)
                         chunk = decompressor.unused_data
                     else:
                         decoded, chunk = chunk, b""
-                    total += len(decoded)
-                    if total > MAX_DECODED_BYTES:
-                        raise DataError(
-                            "File exceeds 128 MiB decoded limit; request a shorter range"
-                        )
                     decoder.write(decoded)
                     yield from decoder.decode()
+            assert decompressor is not None
             if compressed and not decompressor.eof:
                 raise DataError(f"Truncated Zstandard frame: {path}")
             if decoder.buffer():
@@ -323,64 +409,68 @@ def _sha256(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def download(
-    request: Request, directory: str | Path, *, max_cost: float, client=None, budget_path=None,
-    confirm=None,
-) -> dict:
-    """Download only on an explicit call. A verified cache hit needs no client or API key."""
-    if not math.isfinite(max_cost) or max_cost < 0:
-        raise DataError("max_cost must be a finite, nonnegative USD amount")
-    directory = Path(directory)
+
+def _cache_locations(request: Request, directory: Path):
     key = hashlib.sha256(json.dumps(asdict(request), sort_keys=True).encode()).hexdigest()[:16]
     manifest_path = directory / f"{key}.json"
     paths = {schema: directory / f"{key}.{schema}.dbn.zst" for schema in ("definition", "mbo")}
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text())
-            valid = manifest["request"] == asdict(request) and all(
-                path.is_file() and _sha256(path) == manifest["sha256"][schema]
-                for schema, path in paths.items()
-            )
-        except (OSError, ValueError, KeyError) as exc:
-            raise DataError(f"Invalid cache manifest: {manifest_path}") from exc
-        if not valid:
-            raise DataError(
-                "Cached files are missing or changed; inspect them before redownloading"
-            )
-        _validate_pair(paths["mbo"], paths["definition"])
-        return {"cached": True, "paths": paths, "manifest": manifest}
-    if any(
-        path.exists() or path.with_suffix(path.suffix + ".part").exists() for path in paths.values()
-    ):
-        raise DataError("Unfinished download exists; inspect/remove it explicitly before retrying")
-    budget = status(budget_path)
-    if budget["expired"]:
-        raise DataError("Local credit budget expired; verify your Databento billing page")
-    client = client if client is not None else db.Historical()
-    quote = estimate(request, client=client)
-    if quote["total_usd"] > max_cost:
-        raise DataError(f"Estimated ${quote['total_usd']:.6f} exceeds maximum ${max_cost:.6f}")
-    if quote["total_usd"] > float(budget["remaining_usd"]):
-        raise DataError("Estimate exceeds cumulative remaining budget")
-    if confirm is None or confirm({"quote": quote, "budget": budget}) is not True:
-        raise DataError("Download not confirmed; no data requested or budget reserved")
-    resolved = Request(**quote["request"])
+    return manifest_path, paths
+
+
+def _cached_chunk(request: Request, directory: Path):
+    manifest_path, paths = _cache_locations(request, directory)
+    if not manifest_path.exists():
+        if any(
+            path.exists() or path.with_suffix(path.suffix + ".part").exists()
+            for path in paths.values()
+        ):
+            raise DataError("Unfinished download exists; inspect/remove it explicitly before retrying")
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text())
+        valid = manifest["request"] == asdict(request) and all(
+            path.is_file() and _sha256(path) == manifest["sha256"][schema]
+            for schema, path in paths.items()
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        raise DataError(f"Invalid cache manifest: {manifest_path}") from exc
+    if not valid:
+        raise DataError("Cached files are missing or changed; inspect them before redownloading")
+    _validate_pair(paths["mbo"], paths["definition"])
+    return {"cached": True, "paths": paths, "manifest_path": manifest_path, "manifest": manifest}
+
+
+def _download_chunk(
+    request: Request,
+    directory: Path,
+    *,
+    quote: dict,
+    client,
+    budget_path,
+) -> dict:
+    cached = _cached_chunk(request, directory)
+    if cached is not None:
+        return cached
+
+    manifest_path, paths = _cache_locations(request, directory)
     directory.mkdir(parents=True, exist_ok=True)
     partials = {schema: path.with_suffix(path.suffix + ".part") for schema, path in paths.items()}
     reservation = reserve(quote["total_usd"], asdict(request), budget_path)
+
     for schema, path in partials.items():
-        client.timeseries.get_range(**_parameters(resolved, schema), path=path)
+        client.timeseries.get_range(**_parameters(request, schema), path=path)
         inspect_file(path)
+
     _, definitions = _validate_pair(partials["mbo"], partials["definition"])
     resolved_identity = definitions["identities"][0][1]
-    if resolved.stype_in == "instrument_id":
-        if resolved_identity != int(resolved.symbol):
-            raise DataError("Downloaded definition instrument does not match the resolved request")
-    elif definitions["symbols"] != [resolved.symbol]:
-        raise DataError("Downloaded definition symbol does not match the resolved request")
+    if request.stype_in == "instrument_id":
+        if resolved_identity != int(request.symbol):
+            raise DataError("Downloaded definition instrument does not match the planned request")
+    elif definitions["symbols"] != [request.symbol]:
+        raise DataError("Downloaded definition symbol does not match the planned request")
+
     manifest = {
         "request": asdict(request),
-        "resolved_request": asdict(resolved),
         "synthetic": any(symbol.startswith("SYNTH_") for symbol in definitions["symbols"]),
         "estimate": quote,
         "budget_reservation": reservation,
@@ -392,5 +482,152 @@ def download(
     temporary = manifest_path.with_suffix(".json.part")
     temporary.write_text(json.dumps(manifest, indent=2) + "\n")
     temporary.replace(manifest_path)
-    complete(reservation)
-    return {"cached": False, "paths": paths, "manifest": manifest}
+    complete(reservation, manifest_path=manifest_path)
+    return {"cached": False, "paths": paths, "manifest_path": manifest_path, "manifest": manifest}
+
+
+def _range_manifest_path(request: Request, directory: Path) -> Path:
+    key = hashlib.sha256(json.dumps(asdict(request), sort_keys=True).encode()).hexdigest()[:16]
+    return directory / f"{key}.range.json"
+
+
+def iter_range_batches(range_manifest_path: str | Path):
+    """Yield verified (request, MBO path, definition path) chunks in chronological order."""
+    range_manifest_path = Path(range_manifest_path)
+    try:
+        manifest = json.loads(range_manifest_path.read_text())
+        items = manifest["chunks"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DataError(f"Invalid range manifest: {range_manifest_path}") from exc
+
+    directory = range_manifest_path.parent
+    previous_end = None
+    for item in items:
+        try:
+            request = Request(**item["request"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DataError(f"Invalid chunk request in {range_manifest_path}") from exc
+        if previous_end is not None and _utc(request.start) != previous_end:
+            raise DataError("Range manifest has a gap or overlap between chunks")
+        cached = _cached_chunk(request, directory)
+        if cached is None:
+            raise DataError(f"Range cache is incomplete; missing chunk {asdict(request)}")
+        previous_end = _utc(request.end)
+        yield request, cached["paths"]["mbo"], cached["paths"]["definition"]
+
+
+def _load_range_cache(request: Request, directory: Path):
+    path = _range_manifest_path(request, directory)
+    if not path.exists():
+        return None
+    try:
+        manifest = json.loads(path.read_text())
+        if manifest["request"] != asdict(request):
+            raise DataError(f"Range manifest does not match request: {path}")
+        chunks = []
+        for item in manifest["chunks"]:
+            chunk = Request(**item["request"])
+            cached = _cached_chunk(chunk, directory)
+            if cached is None:
+                raise DataError(f"Range cache is incomplete; missing chunk {item['request']}")
+            chunks.append(cached)
+    except DataError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DataError(f"Invalid range manifest: {path}") from exc
+    return {"cached": True, "range_manifest_path": path, "range_manifest": manifest, "chunks": chunks}
+
+
+def download(
+    request: Request, directory: str | Path, *, max_cost: float, client=None, budget_path=None,
+    confirm=None,
+) -> dict:
+    """Download a range safely; multi-day requests fan out into cached single-instrument chunks."""
+    if not math.isfinite(max_cost) or max_cost < 0:
+        raise DataError("max_cost must be a finite, nonnegative USD amount")
+    directory = Path(directory)
+
+    cached_range = _load_range_cache(request, directory)
+    if cached_range is not None:
+        return cached_range
+
+    budget = status(budget_path)
+    if budget["expired"]:
+        raise DataError("Local credit budget expired; verify your Databento billing page")
+    client = client if client is not None else db.Historical()
+
+    chunks = plan(request, client=client)
+    quotes = []
+    cached_results = {}
+    for chunk in chunks:
+        cached = _cached_chunk(chunk, directory)
+        key = json.dumps(asdict(chunk), sort_keys=True)
+        if cached is not None:
+            cached_results[key] = cached
+        else:
+            quotes.append(_estimate_one(chunk, client=client))
+
+    costs = {
+        schema: sum(quote["usd"][schema] for quote in quotes)
+        for schema in ("definition", "mbo")
+    }
+    quote = {
+        "request": asdict(request),
+        "planned_chunks": len(chunks),
+        "cached_chunks": len(cached_results),
+        "download_chunks": len(quotes),
+        "chunks": quotes,
+        "usd": costs,
+        "total_usd": sum(costs.values()),
+    }
+
+    if quote["total_usd"] > max_cost:
+        raise DataError(f"Estimated ${quote['total_usd']:.6f} exceeds maximum ${max_cost:.6f}")
+    if quote["total_usd"] > float(budget["remaining_usd"]):
+        raise DataError("Estimate exceeds cumulative remaining budget")
+    if quotes and (confirm is None or confirm({"quote": quote, "budget": budget}) is not True):
+        raise DataError("Download not confirmed; no new data requested or budget reserved")
+
+    quotes_by_request = {
+        json.dumps(item["request"], sort_keys=True): item
+        for item in quotes
+    }
+    results = []
+    for chunk in chunks:
+        key = json.dumps(asdict(chunk), sort_keys=True)
+        if key in cached_results:
+            results.append(cached_results[key])
+            continue
+        results.append(
+            _download_chunk(
+                chunk,
+                directory,
+                quote=quotes_by_request[key],
+                client=client,
+                budget_path=budget_path,
+            )
+        )
+
+    range_manifest = {
+        "request": asdict(request),
+        "chunks": [
+            {
+                "request": asdict(chunk),
+                "manifest": result["manifest_path"].name,
+            }
+            for chunk, result in zip(chunks, results)
+        ],
+        "estimate_for_new_data": quote,
+    }
+    range_path = _range_manifest_path(request, directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = range_path.with_suffix(".json.part")
+    temporary.write_text(json.dumps(range_manifest, indent=2) + "\n")
+    temporary.replace(range_path)
+    return {
+        "cached": all(result["cached"] for result in results),
+        "range_manifest_path": range_path,
+        "range_manifest": range_manifest,
+        "chunks": results,
+    }
+

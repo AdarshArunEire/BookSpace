@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+from dataclasses import replace
 
 from databento.common.error import BentoError
 
@@ -29,6 +30,15 @@ def confirm_download(details):
         return False
 
 
+def request_from_args(args):
+    if (args.start is None) != (args.end is None):
+        raise ValueError("--start and --end must be supplied together")
+    request = Request.from_toml(args.config)
+    if args.start is not None:
+        request = replace(request, start=args.start, end=args.end)
+    return request
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="mbo")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -45,9 +55,21 @@ def main(argv=None) -> int:
     for name in ("estimate", "download"):
         command = commands.add_parser(name)
         command.add_argument("--config", default="es.toml")
+        command.add_argument(
+            "--start",
+            help="Override profile start in UTC ISO-8601 format (requires --end)",
+        )
+        command.add_argument(
+            "--end",
+            help="Override profile end in UTC ISO-8601 format (requires --start)",
+        )
         if name == "download":
             command.add_argument("--directory", default="data/raw")
             command.add_argument("--max-cost", type=float, required=True)
+            command.add_argument(
+                "--ledger",
+                help="Override MBO_BUDGET_LEDGER for this command",
+            )
     inspection = commands.add_parser("inspect", help="Inspect a local DBN file, without an API key")
     inspection.add_argument("--file", required=True)
     book = commands.add_parser("book", help="Build a book from two local DBN files")
@@ -64,12 +86,13 @@ def main(argv=None) -> int:
             case "discover":
                 result = discover(args.dataset)
             case "estimate":
-                result = estimate(Request.from_toml(args.config))
+                result = estimate(request_from_args(args))
             case "download":
                 result = download(
-                    Request.from_toml(args.config),
+                    request_from_args(args),
                     args.directory,
                     max_cost=args.max_cost,
+                    budget_path=args.ledger,
                     confirm=confirm_download,
                 )
             case "inspect":
