@@ -1,8 +1,6 @@
 """Contracts tested on actual ABIDES output; no alternate history generator."""
 
 import json
-import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
+from mbo_lab.abides import run_abides_export
 from mbo_lab.metrics.fixed import TargetScale, eligible_pairs, rms_distance
 from mbo_lab.observations import (
     FEATURE_SCHEMA_VERSION,
@@ -21,10 +20,9 @@ from mbo_lab.observations import (
     load_observations,
     time_of_day_pair,
 )
-from mbo_lab.paths import DATA
+from mbo_lab.paths import DATA, REPO_ROOT
+from mbo_lab.pipeline import run_training_pipeline
 from mbo_lab.samples import FeatureScale, batch, valid_anchors
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class SampleTests(unittest.TestCase):
@@ -35,21 +33,10 @@ class SampleTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory(dir=scratch)
         cls.addClassCleanup(cls.temp.cleanup)
         cls.output = Path(cls.temp.name)
-        subprocess.run(
-            [
-                sys.executable,
-                str(ROOT / "scripts/training_smoke.py"),
-                "--output",
-                cls.temp.name,
-                "--observations-dir",
-                str(cls.output / "source"),
-                "--end-time",
-                "09:40:00",
-            ],
-            check=True,
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
+        cls.result = run_training_pipeline(
+            output=cls.output,
+            observations_dir=cls.output / "source",
+            end_time="09:40:00",
         )
         cls.obs = load_observations(cls.output / "source/observations.npz")
 
@@ -146,24 +133,15 @@ class SampleTests(unittest.TestCase):
 
     def test_repeatable_abides_run(self):
         second = self.output / "repeat"
-        subprocess.run(
-            [
-                str(ROOT / ".local/abides-env39/Scripts/python.exe"),
-                str(ROOT / "scripts/export_abides.py"),
-                "--output",
-                str(second),
-                "--end-time",
-                "09:40:00",
-            ],
-            check=True,
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-        )
+        run_abides_export(output=second, end_time="09:40:00")
         repeated = load_observations(second / "observations.npz")
         np.testing.assert_array_equal(self.obs.x, repeated.x)
         np.testing.assert_array_equal(self.obs.mid, repeated.mid)
         np.testing.assert_array_equal(self.obs.ts_event, repeated.ts_event)
+
+    def test_abides_run_rejects_local_output(self):
+        with self.assertRaises(ValueError):
+            run_abides_export(output=REPO_ROOT / ".local" / "run")
 
     def test_train_only_scaling(self):
         rows = np.arange(len(self.obs.mid) // 2)

@@ -1,152 +1,67 @@
-"""Full ABIDES -> 86-feature observations -> 256/128 windows -> scaled pair targets."""
+"""Command-line wrapper for the reusable ABIDES training pipeline."""
+
+from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import subprocess
-from dataclasses import asdict, replace
 from pathlib import Path
 
-import numpy as np
-
-from mbo_lab.metrics.fixed import TargetScale, eligible_pairs, pair_targets, rms_distance
-from mbo_lab.observations import (
-    FEATURE_SCHEMA_VERSION,
-    TIME_OF_DAY_TIMEZONE,
-    feature_names,
-    load_observations,
-)
-from mbo_lab.paths import abides_paths
-from mbo_lab.samples import FeatureScale, batch, valid_anchors
-
-ROOT = Path(__file__).resolve().parents[1]
+from mbo_lab.pipeline import run_training_pipeline
 
 
-def run(output=None, seed=0, end_time="10:00:00", observations_dir=None):
-    source_default, output_default = abides_paths(seed, end_time)
-    source = (observations_dir or source_default).resolve()
-    output = (output or output_default).resolve()
-    interpreter = ROOT / ".local/abides-env39/Scripts/python.exe"
-    if not interpreter.exists():
-        raise RuntimeError("Run scripts/setup_abides.py first")
-    subprocess.run(
-        [
-            str(interpreter),
-            str(ROOT / "scripts/export_abides.py"),
-            "--output",
-            str(source),
-            "--seed",
-            str(seed),
-            "--end-time",
-            end_time,
-        ],
-        check=True,
-        cwd=ROOT,
+def run(
+    output=None,
+    seed=0,
+    end_time="10:00:00",
+    observations_dir=None,
+    history=256,
+    horizon=128,
+    anchor_count=64,
+    split_row=None,
+):
+    """Run the default smoke configuration and return its report."""
+    result = run_training_pipeline(
+        output=output,
+        seed=seed,
+        end_time=end_time,
+        observations_dir=observations_dir,
+        history=history,
+        horizon=horizon,
+        anchor_count=anchor_count,
+        split_row=split_row,
     )
-    provenance = json.loads((source / "provenance.json").read_text(encoding="utf-8"))
-    path = source / "observations.npz"
-    if hashlib.sha256(path.read_bytes()).hexdigest() != provenance["observations_sha256"]:
-        raise ValueError("ABIDES observation hash mismatch")
-    if provenance.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
-        raise ValueError("ABIDES provenance has an unsupported feature schema version")
-    obs = load_observations(path)
-    expected_names = feature_names(10)
-    if obs.names != expected_names or obs.x.shape[1] != len(expected_names):
-        raise ValueError(f"Smoke run must use the full {len(expected_names)}-feature schema")
-    split = len(obs.mid) * 2 // 3
-    train = valid_anchors(obs, stop=split)
-    validation = valid_anchors(obs, start=split)
-    if len(train) < 64 or not len(validation):
-        raise ValueError("ABIDES run too short for complete train/validation episodes; extend time")
-    rng = np.random.default_rng(seed)
-    anchors = np.sort(rng.choice(train, size=64, replace=False))
-    pairs = eligible_pairs(anchors)
-    coverage = np.zeros(len(obs.mid) + 1, dtype=np.int64)
-    np.add.at(coverage, train - 255, 1)
-    np.add.at(coverage, train + 1, -1)
-    training_rows = np.flatnonzero(np.cumsum(coverage[:-1]) > 0)
-    features = FeatureScale.fit(obs, training_rows)
-    transformed = replace(obs, x=features.transform(obs))
-    x, y = batch(transformed, anchors, stop=split)
-    raw = pair_targets(y, pairs)
-    scale = TargetScale.fit(raw, seed=seed)
-    targets = pair_targets(y, pairs, scale)
-    query_x, query_y = batch(transformed, validation[:1], start=split)
-    distances = rms_distance(
-        x.reshape(len(x), -1), np.broadcast_to(query_x.reshape(1, -1), (len(x), x[0].size))
-    )
-    nearest = int(np.argmin(distances))
-    report = {
-        "source": "ABIDES RMSC04",
-        "synthetic": True,
-        "clock": obs.clock,
-        "observations": str(path),
-        "provenance": str(source / "provenance.json"),
-        "observations_sha256": provenance["observations_sha256"],
-        "book_rows": len(obs.mid),
-        "segments": len(np.unique(obs.segment)),
-        "feature_schema_version": FEATURE_SCHEMA_VERSION,
-        "feature_count": len(obs.names),
-        "feature_names": list(obs.names),
-        "x_shape": list(obs.x.shape),
-        "y_shape": list(obs.y.shape),
-        "history": 256,
-        "horizon": 128,
-        "split_row": split,
-        "train_anchors": len(train),
-        "validation_anchors": len(validation),
-        "X_shape": list(x.shape),
-        "Y_shape": list(y.shape),
-        "D_shape": list(targets.shape),
-        "eligible_pairs": len(pairs),
-        "target_scale": asdict(scale),
-        "time_delta_transform": (
-            "log1p(time_delta_seconds / time_delta_tau), then train-only mean/std"
-        ),
-        "time_delta_tau": features.time_delta_tau,
-        "time_of_day": {
-            "clock": obs.clock,
-            "timezone": TIME_OF_DAY_TIMEZONE,
-            "period_seconds": 86_400,
-            "encoding": ["tod_sin", "tod_cos"],
-        },
-        "scaled_distance_range": [float(targets.min()), float(targets.max())],
-        "pair_policy": "uniform anchor sample; unique pairs with disjoint complete episodes",
-        "query_anchor": int(validation[0]),
-        "nearest_anchor": int(anchors[nearest]),
-        "forecast_path_rms_error": float(rms_distance(y[nearest], query_y[0])),
-        "purpose": "Full-schema pipeline smoke run; no encoder training or real-market claim",
-    }
-    output.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output / "batch.npz",
-        X=x,
-        Y=y,
-        pairs=pairs,
-        D=targets,
-        D_raw=raw,
-        anchors=anchors,
-        feature_mean=features.mean,
-        feature_scale=features.scale,
-        time_delta_tau=features.time_delta_tau,
-        feature_names=features.names,
-        feature_schema_version=FEATURE_SCHEMA_VERSION,
-        constant_features=features.constant,
-        training_rows=training_rows,
-        target_scale=scale.value,
-        query_X=query_x,
-        query_Y=query_y,
-    )
-    (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps({k: v for k, v in report.items() if k != "feature_names"}, indent=2))
-    return report
+    return result.report
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, help="Override processed smoke output directory")
+    parser.add_argument("--output", type=Path, help="Override processed output directory")
     parser.add_argument("--observations-dir", type=Path, help="Override ABIDES source directory")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--end-time", default="10:00:00")
-    args = parser.parse_args()
-    run(args.output, args.seed, args.end_time, args.observations_dir)
+    parser.add_argument("--history", type=int, default=256)
+    parser.add_argument("--horizon", type=int, default=128)
+    parser.add_argument("--anchor-count", type=int, default=64)
+    parser.add_argument("--split-row", type=int)
+    args = parser.parse_args(argv)
+    report = run(
+        output=args.output,
+        seed=args.seed,
+        end_time=args.end_time,
+        observations_dir=args.observations_dir,
+        history=args.history,
+        horizon=args.horizon,
+        anchor_count=args.anchor_count,
+        split_row=args.split_row,
+    )
+    print(
+        json.dumps(
+            {key: value for key, value in report.items() if key != "feature_names"},
+            indent=2,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

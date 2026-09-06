@@ -29,11 +29,11 @@ from mbo_lab.observations import (  # noqa: E402
     feature_row,
     save_observations,
 )
-from mbo_lab.paths import abides_paths  # noqa: E402
+from mbo_lab.paths import abides_paths, require_data_path  # noqa: E402
 
 
 def run(output=None, seed=0, end_time="10:00:00"):
-    output = (output or abides_paths(seed, end_time)[0]).resolve()
+    output = require_data_path(output or abides_paths(seed, end_time)[0])
     output.mkdir(parents=True, exist_ok=True)
     names = feature_names()
     parameters = dict(

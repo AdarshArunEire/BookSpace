@@ -18,7 +18,7 @@ From BookSpace in PowerShell:
 ```powershell
 py -m uv sync --locked
 py -m uv run python scripts/setup_abides.py
-py -m uv run python scripts/training_smoke.py
+py -m uv run python -m jupyterlab notebooks/abides_pipeline.ipynb
 py -m uv run python -m unittest discover -s tests -p test_samples.py -v
 ```
 
@@ -30,8 +30,11 @@ agent strategies and the upstream order-size model are unchanged. Sources load
 directly from the pinned checkout. Dependencies are pinned in
 `scripts/abides-requirements.txt`.
 
-The default simulation runs from 09:30 to 10:00 in a synthetic session. To extend
-it or change the seed:
+The notebook's smoke cell runs from 09:30 to 10:00 in a synthetic session. To
+extend it or change the seed, edit the full-generation parameter cell and set
+`RUN_FULL = True`. To reuse an existing exported source, set
+`USE_EXISTING_SOURCE = True` instead. The compatibility wrapper remains useful
+for automation:
 
 ```powershell
 py -m uv run python scripts/training_smoke.py --end-time 11:00:00 --seed 1
@@ -47,10 +50,10 @@ history generator. Learned encoders and their training loop remain separate work
 Outputs use the run name `rmsc04-seed-<seed>-until-<HHMMSS>`:
 
 - Source observations, provenance and simulation logs: `data/simulated/abides/<run>/`.
-- Derived smoke batch and report: `data/processed/abides/<run>/smoke/`.
+- Derived smoke or full batch and report: `data/processed/abides/<run>/<batch>/`.
 
 These payloads stay ignored. See [data layout](../data/README.md) for retention and
-future dataset conventions. `--output` overrides the derived smoke directory;
+future dataset conventions. `--output` overrides the derived batch directory;
 `--observations-dir` overrides its simulation directory. When calling the exporter
 directly, its `--output` refers to the simulation directory.
 

@@ -1,15 +1,11 @@
 # BookSpace
 
 BookSpace turns order-book observations into training samples. The current
-working path is:
+pipeline is ABIDES simulation -> feature rows `x` -> history windows `X` and
+future paths `Y` -> scalar pair targets `D`.
 
-```text
-ABIDES simulation -> observation rows x -> histories X and future paths Y -> pair distances D
-```
-
-The smoke pipeline uses 86 visible features, 256-row histories, and 128-step
-future paths. It checks the data structures; learned encoders and the training
-loop come later.
+The current schema has 86 visible features per row, a 256-row history, and a
+128-step future path. Encoder and training-loop implementations come later.
 
 ## Requirements
 
@@ -29,7 +25,7 @@ BookSpace dependencies live in `.venv`. ABIDES has its own pinned Python 3.9
 environment under `.local/abides-env39`. The `.local/` directory is ignored by
 Git and is for ABIDES source and environments, not run data.
 
-## Run the smoke pipeline
+## Run the notebook pipeline
 
 Set up ABIDES once:
 
@@ -37,25 +33,27 @@ Set up ABIDES once:
 py -m uv run python scripts/setup_abides.py
 ```
 
-Generate a run and build a training batch:
+Open the notebook after setup:
 
 ```powershell
-py -m uv run python scripts/training_smoke.py
+py -m uv run python -m jupyterlab notebooks/abides_pipeline.ipynb
 ```
 
-Choose another seed or a longer session with the same command:
-
-```powershell
-py -m uv run python scripts/training_smoke.py --seed 1 --end-time 11:00:00
-```
-
-Generated files go to:
+The first run cell generates the short smoke batch. The full-generation cells
+let you choose a longer session and anchor count; set `RUN_FULL = True` before
+running that cell. Generated files go to:
 
 - `data/simulated/abides/<run>/`: observations, logs, and provenance
 - `data/processed/abides/<run>/smoke/`: the derived batch and report
 
 These payloads are ignored by Git. The tracked layout is documented in
 [data/README.md](data/README.md).
+
+For automation, the compatibility wrapper remains available:
+
+```powershell
+py -m uv run python scripts/training_smoke.py --seed 1 --end-time 11:00:00
+```
 
 ## Check the code
 

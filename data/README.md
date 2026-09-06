@@ -8,7 +8,7 @@ download-budget ledger remain in ignored `.local/`.
 data/
   raw/                         Original Databento DBN files and cache manifests
   simulated/abides/<run>/       ABIDES observations, provenance and logs/
-  processed/abides/<run>/smoke/  Derived batch.npz and report.json
+  processed/abides/<run>/<batch>/ Derived batch.npz and report.json (smoke or full)
   .tests/                      Temporary test runs, removed after tests
 ```
 
