@@ -58,7 +58,16 @@ def extract_observations(mbo_path, definitions_path, depth=10):
             [(float(v["price"]), float(v["size"]), v["orders"]) for v in state[side]]
             for side in ("bids", "asks")
         ]
-        row = feature_row(*sides, mid, tick, record.ts_recv, previous_mid, previous_time, depth)
+        row = feature_row(
+            *sides,
+            mid,
+            tick,
+            record.ts_recv,
+            previous_mid,
+            previous_time,
+            depth=depth,
+            clock="receive",
+        )
         rows.append(row)
         mids.append(mid)
         segments.append(segment)

@@ -22,6 +22,8 @@ from abides_markets.configs import rmsc04  # noqa: E402
 from abides_markets.messages.order import OrderMsg  # noqa: E402
 
 from mbo_lab.observations import (  # noqa: E402
+    FEATURE_SCHEMA_VERSION,
+    TIME_OF_DAY_TIMEZONE,
     Observations,
     feature_names,
     feature_row,
@@ -33,6 +35,7 @@ from mbo_lab.paths import abides_paths  # noqa: E402
 def run(output=None, seed=0, end_time="10:00:00"):
     output = (output or abides_paths(seed, end_time)[0]).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    names = feature_names()
     parameters = dict(
         seed=seed,
         end_time=end_time,
@@ -81,7 +84,18 @@ def run(output=None, seed=0, end_time="10:00:00"):
             previous_mid = previous_time = None
             return
         mid = (bids[0][0] + asks[0][0]) / 2
-        rows.append(feature_row(bids, asks, mid, 1, current_time, previous_mid, previous_time))
+        rows.append(
+            feature_row(
+                bids,
+                asks,
+                mid,
+                1,
+                current_time,
+                previous_mid,
+                previous_time,
+                clock="simulation",
+            )
+        )
         mids.append(mid)
         times.append(current_time)
         segments.append(segment)
@@ -93,13 +107,13 @@ def run(output=None, seed=0, end_time="10:00:00"):
     with patch("socket.socket.connect", side_effect=RuntimeError("Simulation must stay offline")):
         abides.run(config, log_dir=str((output / "logs").resolve()), kernel_seed=seed)
     observations = Observations(
-        np.asarray(rows, dtype=float).reshape(-1, 84),
+        np.asarray(rows, dtype=float).reshape(-1, len(names)),
         np.asarray(mids),
         np.asarray(segments),
         np.asarray(times, dtype=np.uint64),
         np.asarray(times, dtype=np.uint64),
         np.asarray(offsets),
-        feature_names(),
+        names,
         "ABIDES_ABM",
         True,
         "simulation",
@@ -119,6 +133,7 @@ def run(output=None, seed=0, end_time="10:00:00"):
             ["git", "-C", str(VENDOR), "rev-parse", "HEAD"], text=True
         ).strip(),
         "compatibility_patch": "64-bit seed draws and timedelta nanoseconds on Windows",
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "runtime": {
             "python": sys.version,
             **{
@@ -132,7 +147,13 @@ def run(output=None, seed=0, end_time="10:00:00"):
         "clock": "simulation nanoseconds; ts_recv and ts_event both store this clock",
         "sampling": "after each complete exchange OrderMsg during market hours; includes no-ops",
         "price_unit": "ABIDES integer cents; one cent tick; not calibrated ES futures",
-        "features": list(feature_names()),
+        "features": list(names),
+        "time_features": {
+            "clock": "simulation",
+            "timezone": TIME_OF_DAY_TIMEZONE,
+            "period_seconds": 86_400,
+            "encoding": ["tod_sin", "tod_cos"],
+        },
         "rows": len(rows),
         "counts": dict(counts),
         "elapsed_seconds": time.perf_counter() - started,
@@ -142,7 +163,7 @@ def run(output=None, seed=0, end_time="10:00:00"):
         json.dumps(
             {
                 "rows": len(rows),
-                "features": 84,
+                "features": len(names),
                 "counts": dict(counts),
                 "elapsed_seconds": provenance["elapsed_seconds"],
             },

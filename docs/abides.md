@@ -2,9 +2,16 @@
 
 The smoke run executes ABIDES RMSC04 and records visible book states after complete
 exchange order requests. Both ABIDES and the Databento extractor use the same
-84-feature builder: 10 levels per side with relative price, quantity, order count
-and presence, plus spread, elapsed time, latest mid-price log return and an
-initialization flag. Missing levels are masked; invalid states break continuity.
+86-feature builder: 10 levels per side with relative price, quantity, order count
+and presence, plus spread, time delta, latest mid-price log return, an
+initialization flag, and Central Time sine/cosine features. Time delta is stored
+in seconds in the raw row and transformed as `log1p(delta / tau)` with `tau`
+fitted on training rows. Missing levels are masked; invalid states break
+continuity.
+
+The time-of-day channels are `tod_sin` and `tod_cos`, using the observation
+clock and `America/Chicago`. ABIDES timestamps use simulation wall time; real
+Databento receive timestamps are converted from UTC.
 
 From BookSpace in PowerShell:
 
@@ -34,7 +41,7 @@ Every smoke run executes ABIDES -> x and one-step y -> chronological 256-row X a
 128-step cumulative Y -> disjoint pair distances D. Feature transforms and the
 positive-median distance scale are fitted only on training data. It then exercises
 standardized Euclidean one-neighbour retrieval on a validation query. The batch
-shape is `(64, 256, 84)`. There is no reduced-feature fallback or custom synthetic
+shape is `(64, 256, 86)`. There is no reduced-feature fallback or custom synthetic
 history generator. Learned encoders and their training loop remain separate work.
 
 Outputs use the run name `rmsc04-seed-<seed>-until-<HHMMSS>`:
@@ -49,8 +56,10 @@ directly, its `--output` refers to the simulation directory.
 
 Files:
 
-- `observations.npz`: raw x, mid-price, one-step y, timestamps, segments and feature names.
-- `batch.npz`: transformed X, cumulative Y, pairs, raw/scaled D and fitted scales.
+- `observations.npz`: schema-versioned raw x, mid-price, one-step y, timestamps,
+  segments and feature names.
+- `batch.npz`: transformed X, cumulative Y, pairs, raw/scaled D, fitted scales,
+  and `time_delta_tau`.
 - `provenance.json`: source revision, patched-source hashes, runtime, configuration,
   observation hash, sampling/clock definitions and invalid-state counts.
 - `report.json`: dimensions, train/validation counts and smoke results.

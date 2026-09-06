@@ -1,4 +1,4 @@
-"""Full ABIDES -> 84-feature observations -> 256/128 windows -> scaled pair targets."""
+"""Full ABIDES -> 86-feature observations -> 256/128 windows -> scaled pair targets."""
 
 import argparse
 import hashlib
@@ -10,7 +10,12 @@ from pathlib import Path
 import numpy as np
 
 from mbo_lab.metrics.fixed import TargetScale, eligible_pairs, pair_targets, rms_distance
-from mbo_lab.observations import feature_names, load_observations
+from mbo_lab.observations import (
+    FEATURE_SCHEMA_VERSION,
+    TIME_OF_DAY_TIMEZONE,
+    feature_names,
+    load_observations,
+)
 from mbo_lab.paths import abides_paths
 from mbo_lab.samples import FeatureScale, batch, valid_anchors
 
@@ -42,9 +47,12 @@ def run(output=None, seed=0, end_time="10:00:00", observations_dir=None):
     path = source / "observations.npz"
     if hashlib.sha256(path.read_bytes()).hexdigest() != provenance["observations_sha256"]:
         raise ValueError("ABIDES observation hash mismatch")
+    if provenance.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
+        raise ValueError("ABIDES provenance has an unsupported feature schema version")
     obs = load_observations(path)
-    if obs.names != feature_names(10) or obs.x.shape[1] != 84:
-        raise ValueError("Smoke run must use the full 84-feature schema")
+    expected_names = feature_names(10)
+    if obs.names != expected_names or obs.x.shape[1] != len(expected_names):
+        raise ValueError(f"Smoke run must use the full {len(expected_names)}-feature schema")
     split = len(obs.mid) * 2 // 3
     train = valid_anchors(obs, stop=split)
     validation = valid_anchors(obs, start=split)
@@ -77,6 +85,7 @@ def run(output=None, seed=0, end_time="10:00:00", observations_dir=None):
         "observations_sha256": provenance["observations_sha256"],
         "book_rows": len(obs.mid),
         "segments": len(np.unique(obs.segment)),
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "feature_count": len(obs.names),
         "feature_names": list(obs.names),
         "x_shape": list(obs.x.shape),
@@ -91,6 +100,16 @@ def run(output=None, seed=0, end_time="10:00:00", observations_dir=None):
         "D_shape": list(targets.shape),
         "eligible_pairs": len(pairs),
         "target_scale": asdict(scale),
+        "time_delta_transform": (
+            "log1p(time_delta_seconds / time_delta_tau), then train-only mean/std"
+        ),
+        "time_delta_tau": features.time_delta_tau,
+        "time_of_day": {
+            "clock": obs.clock,
+            "timezone": TIME_OF_DAY_TIMEZONE,
+            "period_seconds": 86_400,
+            "encoding": ["tod_sin", "tod_cos"],
+        },
         "scaled_distance_range": [float(targets.min()), float(targets.max())],
         "pair_policy": "uniform anchor sample; unique pairs with disjoint complete episodes",
         "query_anchor": int(validation[0]),
@@ -109,7 +128,9 @@ def run(output=None, seed=0, end_time="10:00:00", observations_dir=None):
         anchors=anchors,
         feature_mean=features.mean,
         feature_scale=features.scale,
+        time_delta_tau=features.time_delta_tau,
         feature_names=features.names,
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
         constant_features=features.constant,
         training_rows=training_rows,
         target_scale=scale.value,

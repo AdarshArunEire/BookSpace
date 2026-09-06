@@ -984,6 +984,7 @@ dependencies = [
     { name = "databento-dbn" },
     { name = "nautilus-trader" },
     { name = "numpy" },
+    { name = "tzdata" },
     { name = "zstandard" },
 ]
 
@@ -1002,6 +1003,7 @@ requires-dist = [
     { name = "databento-dbn", specifier = "==0.69.0" },
     { name = "nautilus-trader", specifier = "==1.231.0" },
     { name = "numpy", specifier = ">=2.5.2" },
+    { name = "tzdata", specifier = ">=2025.2" },
     { name = "zstandard", specifier = "==0.25.0" },
 ]
 

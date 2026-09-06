@@ -35,18 +35,28 @@ class FeatureScale:
     scale: np.ndarray
     constant: np.ndarray
     training_rows: np.ndarray
+    time_delta_tau: float
 
     @staticmethod
-    def _prepare(x, names):
+    def _prepare(x, names, time_delta_tau):
         values = np.asarray(x, dtype=float).copy()
         valid = np.ones_like(values, dtype=bool)
-        binary = np.zeros(len(names), dtype=bool)
+        protected = np.zeros(len(names), dtype=bool)
+        if not np.isfinite(time_delta_tau) or time_delta_tau <= 0:
+            raise ValueError("time_delta_tau must be finite and positive")
         for col, name in enumerate(names):
-            binary[col] = name.endswith("_present") or name == "initial"
-            if name.endswith(("_quantity", "_orders")) or name == "elapsed_seconds":
+            protected[col] = (
+                name.endswith("_present")
+                or name == "initial"
+                or name in ("tod_sin", "tod_cos")
+            )
+            if name.endswith(("_quantity", "_orders")) or name == "time_delta_seconds":
                 if np.any(values[:, col] < 0):
-                    raise ValueError("Counts, quantities and elapsed times must be nonnegative")
-                values[:, col] = np.log1p(values[:, col])
+                    raise ValueError("Counts, quantities and time deltas must be nonnegative")
+                if name == "time_delta_seconds":
+                    values[:, col] = np.log1p(values[:, col] / time_delta_tau)
+                else:
+                    values[:, col] = np.log1p(values[:, col])
             if name.endswith(("_price_ticks", "_quantity", "_orders")):
                 prefix = (
                     name.rsplit("_", 2)[0]
@@ -54,18 +64,35 @@ class FeatureScale:
                     else name.rsplit("_", 1)[0]
                 )
                 valid[:, col] = values[:, names.index(prefix + "_present")] == 1
-        return values, valid, binary
+        return values, valid, protected
+
+    @staticmethod
+    def _fit_time_delta_tau(x, names):
+        try:
+            column = names.index("time_delta_seconds")
+        except ValueError as exc:
+            raise ValueError("Feature schema must contain time_delta_seconds") from exc
+        deltas = np.asarray(x[:, column], dtype=float)
+        if not np.isfinite(deltas).all() or np.any(deltas < 0):
+            raise ValueError("Time deltas must be finite and nonnegative")
+        positive = deltas[deltas > 0]
+        if not len(positive):
+            raise ValueError("Training rows must contain a positive time delta")
+        return float(np.median(positive))
 
     @classmethod
     def fit(cls, observations, training_rows):
         rows = np.unique(np.asarray(training_rows, dtype=np.int64))
         if not len(rows) or rows.min() < 0 or rows.max() >= len(observations.mid):
             raise ValueError("Need valid training row indices")
-        values, valid, binary = cls._prepare(observations.x[rows], observations.names)
+        time_delta_tau = cls._fit_time_delta_tau(observations.x[rows], observations.names)
+        values, valid, protected = cls._prepare(
+            observations.x[rows], observations.names, time_delta_tau
+        )
         mean, scale = np.zeros(values.shape[1]), np.ones(values.shape[1])
         constant = np.zeros(values.shape[1], dtype=bool)
         for col in range(values.shape[1]):
-            if binary[col]:
+            if protected[col]:
                 continue
             present = values[valid[:, col], col]
             if len(present):
@@ -75,12 +102,10 @@ class FeatureScale:
                     scale[col] = std
                 else:
                     constant[col] = True
-            else:
-                constant[col] = True
-        return cls(observations.names, mean, scale, constant, rows)
+        return cls(observations.names, mean, scale, constant, rows, time_delta_tau)
 
     def transform(self, observations):
         if observations.names != self.names:
             raise ValueError("Feature schema mismatch")
-        values, valid, _ = self._prepare(observations.x, self.names)
+        values, valid, _ = self._prepare(observations.x, self.names, self.time_delta_tau)
         return np.where(valid, (values - self.mean) / self.scale, 0)
