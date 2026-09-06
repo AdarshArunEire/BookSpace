@@ -5,10 +5,12 @@ __pycache__/
 .ruff_cache/
 data/raw/
 data/manifests/
+data/simulated/
+data/processed/
+data/.tests/
 .env
 .local/
 dist/
 notes/
 
-notebooks/synthetic_view.ipynb
 notebooks/outputs

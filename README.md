@@ -7,55 +7,29 @@ We take it one step further by asking what does ***“like this”*** *actually 
 
 Best work lives at [`final_trading_alg.py`](final_trading_alg.py).
 
----
+## Training sample structures
 
-
-### TEMP NOTES!!!! :
-
-# MBO lab
-
-Databento compressed DBN files -> Nautilus deltas -> Nautilus L3 order book.
-
-The working code is in `src/mbo_lab/data.py` and `cli.py`. Research modules are empty,
-as requested. This uses Python namespace packages: no `__init__.py` files are needed.
-Git has not been initialised.
-
-## Environment
-
-From this directory in PowerShell:
+The full smoke run now uses **ABIDES RMSC04**, with all **84 features** per
+observation, 256-row histories, 128-step cumulative future returns and scaled
+pair distances. The old synthetic fixtures and generators have been removed.
 
 ```powershell
-python -m pip install uv
-python -m uv sync --locked
-python -m uv run jupyter lab notebooks/smoke.ipynb
+py -m uv sync --locked
+py -m uv run python scripts/setup_abides.py
+py -m uv run python scripts/training_smoke.py
 ```
 
-uv installs managed CPython 3.13 and the locked dependencies into `.venv`.
-The SDK versions are Databento 0.86.0 and NautilusTrader 1.231.0. Use this project's
-kernel when opening the notebook in another editor. The first cell reports versions.
+Setup is needed once. ABIDES runs in a separate pinned Python 3.9 environment;
+BookSpace remains on Python 3.13. Outputs are organized under `data/simulated/abides/` and `data/processed/abides/`.
+See [ABIDES setup, schema and tests](docs/abides.md) for details.
+Learned encoders and their training loop are not implemented yet.
 
-## Synthetic smoke run
+## Databento reconstruction
 
-Run all cells in `notebooks/smoke.ipynb`. It writes two clearly labelled fixtures and
-a provenance manifest under `data/synthetic/`, then exercises the real Nautilus loader.
-Socket connections and Databento client construction are forbidden during offline checks.
-
-**SYNTHETIC: pipeline checks only.** The prices, quantities, and order flow are invented.
-The fixture covers snapshot/reset, add, modify, cancel, trade/fill attribution,
-malformed input failures, deterministic reconstruction, and verified download caching.
-The notebook saves its outputs so the assertions and resulting book can be reviewed.
-
-The fixture generator is entirely in the notebook's **Disposable synthetic fixture
-generator** section. Delete that section when it is no longer useful; keep the labelled
-data. The later corruption tests also use its helpers and can be removed with it.
-Production code contains no generator or synthetic fallback.
-
-Inspect the generated data from the terminal:
-
-```powershell
-python -m uv run mbo inspect --file data/synthetic/SYNTH_ES.mbo.dbn.zst
-python -m uv run mbo book --mbo data/synthetic/SYNTH_ES.mbo.dbn.zst --definitions data/synthetic/SYNTH_ES.definition.dbn.zst
-```
+Real DBN -> Nautilus L3 book reconstruction remains in `src/mbo_lab/data.py`.
+`extract.py` samples raw F_LAST boundaries into the shared observation schema;
+`samples.py` constructs windows within explicit chronological splits and valid
+segments. Session boundaries must be supplied; no exchange calendar is inferred.
 
 ## Real ES data
 
@@ -83,18 +57,6 @@ silently downloaded again. Inspect any `.part` files before manually removing th
 The download command prints the two file paths. Pass those to `mbo book --mbo ... --definitions ...`.
 The `book` and `inspect` commands never access the network.
 
-To enable the notebook's separate real-data smoke section, set these **before launching
-the kernel**, with your chosen cost cap and the API key already configured:
-
-```powershell
-$env:MBO_RUN_LIVE = '1'
-$env:MBO_MAX_COST_USD = '0.10'
-python -m uv run jupyter lab notebooks/smoke.ipynb
-```
-
-It checks discovery -> estimate -> download -> a populated ES book. The section is
-skipped by default and never substitutes synthetic data. The offline checks remain offline.
-
 ## Python interface and boundaries
 
 ```python
@@ -116,14 +78,14 @@ and F_LAST on the final **raw** record. Raw fill/status records may close an eve
 when Nautilus emits no delta. Files remain in original order; timestamps are not used to
 sort or invent event boundaries.
 
-Only the final book is exposed. Integrity is checked after applying the whole file,
+`build_book` exposes the final book; `extract_observations` exposes event rows. Integrity is checked after applying the whole file,
 not during a partial snapshot or matching event. A structurally valid, crossed book is
 also rejected; CME books can legitimately cross outside continuous trading, so this
 strict initial interface is intended for continuous-trading endpoints. Integrity checks
 do not prove that a provider delivered every exchange message. The historical API filters
 MBO on receive time, and the pinned Nautilus decoder uses receive time for its event timestamp.
 
-No Parquet catalog, server, simulator, or custom matching engine is included.
+No Parquet catalog, server or custom matching engine is included. ABIDES runs separately.
 
 ## Paid historical downloads
 
