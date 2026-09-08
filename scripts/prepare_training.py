@@ -7,12 +7,22 @@ from pathlib import Path
 
 import numpy as np
 
-from mbo_lab.corpus import audit_corpus, fingerprint, read_corpus, write_json
+from mbo_lab.corpus import (
+    audit_corpus,
+    audit_databento_corpus,
+    fingerprint,
+    read_corpus,
+    write_json,
+)
 from mbo_lab.measurements import process_peak_bytes
 from mbo_lab.pair_index import PairIndex, PairTraversal
 from mbo_lab.paths import DATA, require_data_path
-from mbo_lab.preprocessing import fit_preprocessing, read_preprocessing
-from mbo_lab.stream import PairStream
+from mbo_lab.preprocessing import (
+    fit_databento_preprocessing,
+    fit_preprocessing,
+    read_preprocessing,
+)
+from mbo_lab.stream import open_pair_stream
 
 
 def fixed_validation(corpus, path, count=8192, seed=29):
@@ -39,7 +49,7 @@ def fixed_validation(corpus, path, count=8192, seed=29):
 def benchmark(corpus, root, preprocessing, output, *, workers, queue_pairs, memory_gib, queues):
     started = time.perf_counter()
     seen, queue_timings = set(), []
-    with PairStream(
+    with open_pair_stream(
         corpus,
         root,
         preprocessing,
@@ -107,11 +117,19 @@ def main():
     if args.action == "audit":
         if args.source is None:
             parser.error("audit requires --source")
-        audit_corpus(args.source, output / "corpus.json", workers=args.workers)
+        source = args.source.resolve()
+        chunked = any((path / "observations.json").is_file() for path in source.iterdir())
+        if chunked:
+            audit_databento_corpus(source, output / "corpus.json")
+        else:
+            audit_corpus(source, output / "corpus.json", workers=args.workers)
         return
     corpus, root = read_corpus(output / "corpus.json")
     if args.action == "fit":
-        fit_preprocessing(corpus, root, output / "preprocessing.json")
+        if corpus.get("source_format") == "observation-chunks-v1":
+            fit_databento_preprocessing(corpus, root, output / "preprocessing.json")
+        else:
+            fit_preprocessing(corpus, root, output / "preprocessing.json")
     elif args.action == "validation":
         fixed_validation(corpus, output / "validation_pairs.json")
     else:
@@ -129,4 +147,4 @@ def main():
 
 
 if __name__ == "__main__":
-    ()
+    main()

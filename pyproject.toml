@@ -10,8 +10,11 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "databento==0.86.0",
     "databento-dbn==0.69.0",
+    "matplotlib>=3.11.1",
     "nautilus_trader==1.231.0",
     "numpy>=2.5.2",
+    "scikit-learn>=1.9.0",
+    "torch",
     "tzdata>=2025.2",
     "zstandard==0.25.0",
 ]
@@ -25,7 +28,6 @@ dev = [
     "ipykernel>=6.30",
     "nbclient>=0.10",
     "ruff>=0.12",
-    "matplotlib>=3.11.1",
     "line-profiler>=5.0.2",
 ]
 
@@ -38,3 +40,11 @@ target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }

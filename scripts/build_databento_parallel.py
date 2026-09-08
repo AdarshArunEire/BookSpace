@@ -19,8 +19,9 @@ import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +148,7 @@ def _preflight_initial_snapshot(job: Job) -> tuple[str, bool, str]:
     """
     try:
         import databento_dbn as dbn
+
         from mbo_lab.dbn_replay import raw_records
 
         metrics: dict[str, Any] = {

@@ -106,6 +106,7 @@ class ObservationReader:
         self.stops = np.array([c["stop"] for c in m["chunks"]])
         self.cache_bytes, self.resident_bytes, self.peak_bytes = cache_bytes, 0, 0
         self.cache = OrderedDict()
+        self.verified_chunks = {}
         self.metrics = {
             "cache_hits": 0,
             "cache_misses": 0,
@@ -116,16 +117,26 @@ class ObservationReader:
             "requested_rows": 0,
         }
 
-    def _load(self, index):
-        if index in self.cache:
+    def _load(self, index, columns=COLUMNS):
+        key = (index, tuple(columns))
+        if key in self.cache:
             self.metrics["cache_hits"] += 1
-            self.cache.move_to_end(index)
-            return self.cache[index]
+            self.cache.move_to_end(key)
+            return self.cache[key]
         chunk = self.manifest["chunks"][index]
         path = (self.directory / chunk["path"]).resolve()
         started = time.perf_counter()
-        if not path.is_relative_to(self.directory) or file_hash(path) != chunk["sha256"]:
-            raise ValueError("Chunk path/checksum mismatch")
+        if not path.is_relative_to(self.directory):
+            raise ValueError("Chunk path escapes observation directory")
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            raise ValueError("Chunk path/checksum mismatch") from exc
+        signature = (stat.st_size, stat.st_mtime_ns)
+        if self.verified_chunks.get(index) != signature:
+            if file_hash(path) != chunk["sha256"]:
+                raise ValueError("Chunk path/checksum mismatch")
+            self.verified_chunks[index] = signature
         self.metrics["checksum_seconds"] += time.perf_counter() - started
         self.metrics["cache_misses"] += 1
         while self.cache and self.resident_bytes + chunk["array_bytes"] > self.cache_bytes:
@@ -135,17 +146,20 @@ class ObservationReader:
             del evicted
         started = time.perf_counter()
         with np.load(path, allow_pickle=False) as archive:
-            arrays = {k: archive[k] for k in COLUMNS}
+            arrays = {column: archive[column] for column in columns}
         self.metrics["npz_load_seconds"] += time.perf_counter() - started
-        self.metrics["loaded_array_bytes"] += chunk["array_bytes"]
+        loaded_bytes = sum(array.nbytes for array in arrays.values())
+        self.metrics["loaded_array_bytes"] += loaded_bytes
         n = chunk["stop"] - chunk["start"]
-        if arrays["x"].shape != (n, 86) or any(arrays[k].shape != (n,) for k in COLUMNS[1:]):
-            raise ValueError("Chunk column shape mismatch")
-        if sum(a.nbytes for a in arrays.values()) != chunk["array_bytes"]:
+        for column, array in arrays.items():
+            expected = (n, 86) if column == "x" else (n,)
+            if array.shape != expected:
+                raise ValueError("Chunk column shape mismatch")
+        if tuple(columns) == COLUMNS and loaded_bytes != chunk["array_bytes"]:
             raise ValueError("Chunk byte accounting mismatch")
-        self.resident_bytes += chunk["array_bytes"]
+        self.resident_bytes += loaded_bytes
         self.peak_bytes = max(self.peak_bytes, self.resident_bytes)
-        self.cache[index] = arrays
+        self.cache[key] = arrays
         return arrays
 
     def read_rows(self, rows, columns=COLUMNS):
@@ -170,12 +184,23 @@ class ObservationReader:
         indices = np.searchsorted(self.stops, rows, side="right")
         for index in np.unique(indices):
             positions = np.flatnonzero(indices == index)
-            source = self._load(int(index))
+            source = self._load(int(index), columns)
             local = rows[positions] - self.manifest["chunks"][index]["start"]
             for k in columns:
                 result[k][positions] = source[k][local]
             del source
         return result
+
+    def iter_ranges(self, ranges, columns=("x",), *, batch_rows=65536):
+        """Yield contiguous row batches from half-open logical ranges."""
+        if not isinstance(batch_rows, int) or not 1 <= batch_rows <= 131072:
+            raise ValueError("batch_rows must be between 1 and 131072")
+        for start, stop in ranges:
+            if not 0 <= start <= stop <= self.manifest["rows"]:
+                raise ValueError("Invalid logical row range")
+            for offset in range(start, stop, batch_rows):
+                rows = np.arange(offset, min(offset + batch_rows, stop), dtype=np.int64)
+                yield self.read_rows(rows, columns)
 
     def anchor_ranges(self, history=256, horizon=128):
         return [
@@ -184,16 +209,21 @@ class ObservationReader:
             if s["stop"] - s["start"] >= history + horizon
         ]
 
-    def episodes(self, anchors, history=256, horizon=128):
+    def histories(self, anchors, history=256, horizon=128):
         anchors = np.asarray(anchors, dtype=np.int64)
         ranges = self.anchor_ranges(history, horizon)
-        if anchors.ndim != 1 or len(anchors) > 256 or history < 1 or horizon < 1:
-            raise ValueError("Need at most 256 anchors and positive window lengths")
+        max_anchors = 131072 // history
+        if anchors.ndim != 1 or len(anchors) > max_anchors or history < 1 or horizon < 1:
+            raise ValueError(f"Need at most {max_anchors} anchors and positive window lengths")
         if not all(any(a <= t < b for a, b in ranges) for t in anchors):
             raise ValueError("Episode crosses logical segment/timeline boundary")
         past = anchors[:, None] + np.arange(1 - history, 1)
+        return self.read_rows(past.ravel(), ("x",))["x"].reshape(len(anchors), history, 86)
+
+    def episodes(self, anchors, history=256, horizon=128):
+        anchors = np.asarray(anchors, dtype=np.int64)
+        X = self.histories(anchors, history, horizon)
         future = anchors[:, None] + np.arange(horizon + 1)
-        X = self.read_rows(past.ravel(), ("x",))["x"].reshape(len(anchors), history, 86)
         mid = self.read_rows(future.ravel(), ("mid",))["mid"].reshape(len(anchors), horizon + 1)
         return X, np.log(mid[:, 1:] / mid[:, :1])
 

@@ -1,8 +1,8 @@
 # Training, validation and test execution notes
 
-Updated 7 September 2026. This document records measured data costs and the plan
-for future loops. No model, optimizer, forecast evaluation or test-set scoring
-was implemented or run during this work.
+Updated 8 September 2026. This document records measured data costs, the real-data
+preparation boundary, and the experiment execution path. No final test-set scoring
+has been run.
 
 ## Data primitives and current boundary
 
@@ -20,10 +20,36 @@ definition-derived 0.25 tick. April has not been processed by this pilot.
   fields: X, Y, pair mappings, raw/scaled distances and source/pair IDs. It rejects
   an incompatible preprocessing corpus or reader source version.
 
-This is the first generalization after the replay checks passed. The full-corpus
-scheduler, Databento-aware audit and shared real-training preprocessing are still
-pending. The existing ABIDES `PairStream` remains its separate working pipeline;
-the pilot is not silently mixed into it. Real ES normalization has not been fitted.
+The daily `observation-chunks-v1` stores now have a Databento-aware corpus audit,
+resumable train-only preprocessing, and a chunk-backed implementation of the shared
+pair-stream contract. The ABIDES and Databento loaders remain distinct behind that
+contract; real and simulated sources are not silently mixed. Real ES normalization
+has not finished fitting yet.
+
+## Real daily corpus and preprocessing
+
+`data/corpus.json` freezes 102 completed daily timelines: 51 January-February
+training days, 26 March validation days, and 25 April test days. It contains
+1,053,989,726 eligible anchors. The incomplete `20250418` store is explicitly
+excluded. `data/validation_pairs.json` freezes 8,192 March pair IDs with seed 29.
+
+Preprocessing scans only training history rows. It uses a deterministic one-million
+value random-priority reservoir for the positive time-gap median, then makes a
+second bounded pass for feature statistics and samples 100,000 training pairs for
+target-distance units. Progress is saved after every day in
+`data/preprocessing.progress.npz`; rerunning the same command resumes it. The current
+checkpoint has completed 5 of 51 days in the first pass.
+
+```powershell
+uv run python .\scripts\prepare_training.py fit --output ".\data"
+```
+
+After this creates `data/preprocessing.json`, the experiment wrapper can consume
+the real daily stores. `scripts/experiments.py` is a thin entry point over the
+reusable `mbo_lab.experiment` API. Its `all` stage trains for the requested pair
+budget, then deliberately visits every training anchor for prototype fitting and
+future summaries and every validation anchor for forecast evaluation. On this
+corpus those full-anchor stages are much larger than the 1,000-step encoder fit.
 
 The installed Nautilus loader returns a whole-file list, so this prototype feeds
 it small temporary compressed DBN blocks. Both record-block size and observation

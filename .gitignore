@@ -8,6 +8,10 @@ data/manifests/
 data/simulated/
 data/processed/
 data/.tests/
+data/corpus.json
+data/preprocessing.json
+data/preprocessing.progress.npz
+data/validation_pairs.json
 .env
 .local/
 dist/

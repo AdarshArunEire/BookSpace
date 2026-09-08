@@ -5,6 +5,7 @@ import json
 import os
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -264,6 +265,80 @@ def audit_corpus(root, output, *, history=256, horizon=128, workers=2, progress=
         "names": list(feature_names()),
         "schema_version": FEATURE_SCHEMA_VERSION,
         "split_policy": "whole sessions in date-label order; floor 70%, floor 15%, remainder",
+        "sessions": records,
+        "excluded": excluded,
+    }
+    body["fingerprint"] = fingerprint(body)
+    write_json(output, body)
+    return body
+
+
+def audit_databento_corpus(root, output, *, history=256, horizon=128, progress=print):
+    """Freeze completed daily observation-chunk stores with calendar splits."""
+    from mbo_lab.observation_store import ObservationReader
+
+    root, output = Path(root).resolve(), Path(output).resolve()
+    if output.exists():
+        raise FileExistsError("Frozen corpus already exists; use a new output")
+    if history < 1 or horizon < 1:
+        raise ValueError("History and horizon must be positive")
+    records, excluded = [], []
+    directories = sorted(path for path in root.iterdir() if path.is_dir())
+    for index, source in enumerate(directories, 1):
+        try:
+            day = datetime.strptime(source.name, "%Y%m%d").date()
+        except ValueError as exc:
+            raise ValueError(f"Unexpected daily source directory: {source}") from exc
+        manifest_path = source / "observations.json"
+        if not manifest_path.is_file():
+            excluded.append({"path": source.name, "reason": "incomplete observation store"})
+            continue
+        reader = ObservationReader(source, cache_bytes=64 * 1024**2)
+        month = day.strftime("%Y-%m")
+        split = (
+            "train"
+            if month <= "2025-02"
+            else "validation"
+            if month == "2025-03"
+            else "test"
+            if month == "2025-04"
+            else None
+        )
+        if split is None:
+            excluded.append({"path": source.name, "reason": "outside 2025-01 through 2025-04"})
+            continue
+        record = reader.pair_record(split=split, history=history, horizon=horizon)
+        record.update(
+            {
+                "path": source.name,
+                "date": day.isoformat(),
+                "rows": int(reader.manifest["rows"]),
+                "instrument": reader.manifest["instrument"],
+                "max_chunk_bytes": max(
+                    int(chunk["array_bytes"]) for chunk in reader.manifest["chunks"]
+                ),
+            }
+        )
+        if record["anchors"]:
+            records.append(record)
+        else:
+            excluded.append({"path": source.name, "reason": "no complete episodes"})
+        if progress and (index % 10 == 0 or index == len(directories)):
+            progress(f"Audited {index}/{len(directories)} daily stores", flush=True)
+    if not records or {record["split"] for record in records} != {"train", "validation", "test"}:
+        raise ValueError("Databento corpus must contain train, validation and test days")
+    ids = [record["id"] for record in records]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate logical timeline IDs")
+    body = {
+        "version": 1,
+        "source_format": "observation-chunks-v1",
+        "root": os.path.relpath(root, output.parent),
+        "history": history,
+        "horizon": horizon,
+        "names": list(feature_names()),
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "split_policy": "whole UTC-labelled daily stores; Jan-Feb train, Mar validation, Apr test",
         "sessions": records,
         "excluded": excluded,
     }

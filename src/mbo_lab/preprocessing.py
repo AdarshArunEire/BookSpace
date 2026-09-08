@@ -1,6 +1,7 @@
 """Shared training-only statistics and bounded exact scalar median selection."""
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -165,6 +166,239 @@ def fit_preprocessing(corpus, root, output, *, target_pairs=100000, seed=17, pro
     }
     body["fingerprint"] = fingerprint(body)
     write_json(output, body)
+    return body
+
+
+def _save_chunk_progress(path, **state):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        np.savez_compressed(stream, **state)
+    os.replace(temporary, path)
+
+
+def _load_chunk_progress(path, corpus, seed):
+    path = Path(path)
+    if not path.exists():
+        return None
+    with np.load(path, allow_pickle=False) as saved:
+        state = {key: saved[key].copy() for key in saved.files}
+    if str(state["corpus"].item()) != corpus["fingerprint"] or int(state["seed"]) != seed:
+        raise ValueError("Incompatible Databento preprocessing progress")
+    return state
+
+
+def _priority_sample(values, keys, incoming, rng, capacity):
+    incoming = np.asarray(incoming, dtype=np.float64)
+    if not len(incoming):
+        return values, keys
+    incoming_keys = rng.random(len(incoming))
+    values = np.concatenate((values, incoming))
+    keys = np.concatenate((keys, incoming_keys))
+    if len(values) > capacity:
+        keep = np.argpartition(keys, capacity - 1)[:capacity]
+        values, keys = values[keep], keys[keep]
+    return values, keys
+
+
+def fit_databento_preprocessing(
+    corpus,
+    root,
+    output,
+    *,
+    target_pairs=100000,
+    seed=17,
+    gap_sample=1000000,
+    progress=print,
+):
+    """Fit bounded train-only transforms from observation-chunks-v1 stores.
+
+    The positive time-gap median uses a deterministic uniform reservoir. Progress
+    is committed after each day and reused after interruption.
+    """
+    from mbo_lab.observation_store import ObservationReader
+
+    output, root = Path(output), Path(root).resolve()
+    if output.exists():
+        raise FileExistsError("Preprocessing already exists; use a new output")
+    if not 1 <= target_pairs <= 200000 or gap_sample < 1000:
+        raise ValueError("Invalid target-pair or time-gap sample budget")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    progress_path = output.with_suffix(".progress.npz")
+    records = [record for record in corpus["sessions"] if record["split"] == "train"]
+    names = tuple(corpus["names"])
+    history, horizon = int(corpus["history"]), int(corpus["horizon"])
+    delta_col = names.index("time_delta_seconds")
+    state = _load_chunk_progress(progress_path, corpus, seed)
+
+    if state is None or str(state["phase"].item()) == "gaps":
+        next_record = 0 if state is None else int(state["next_record"])
+        values = np.empty(0, dtype=np.float64) if state is None else state["values"]
+        keys = np.empty(0, dtype=np.float64) if state is None else state["keys"]
+        seen = 0 if state is None else int(state["seen"])
+        rng = np.random.default_rng(seed + 1)
+        if state is not None:
+            rng.bit_generator.state = json.loads(str(state["rng_state"].item()))
+        for index in range(next_record, len(records)):
+            record = records[index]
+            reader = ObservationReader(
+                root / record["path"], cache_bytes=int(record["max_chunk_bytes"])
+            )
+            if reader.manifest["fingerprint"] != record["source_fingerprint"]:
+                raise ValueError(f"Changed observation source: {record['id']}")
+            for batch_values in reader.iter_ranges(
+                history_ranges(record, history), ("x",), batch_rows=65536
+            ):
+                gaps = batch_values["x"][:, delta_col]
+                positive = gaps[gaps > 0]
+                if not np.isfinite(gaps).all() or np.any(gaps < 0):
+                    raise ValueError(f"Invalid time gaps: {record['id']}")
+                seen += len(positive)
+                values, keys = _priority_sample(values, keys, positive, rng, gap_sample)
+            _save_chunk_progress(
+                progress_path,
+                corpus=corpus["fingerprint"],
+                seed=seed,
+                phase="gaps",
+                next_record=index + 1,
+                values=values,
+                keys=keys,
+                seen=seen,
+                rng_state=json.dumps(rng.bit_generator.state),
+            )
+            if progress:
+                progress(f"Training gap pass {index + 1}/{len(records)}", flush=True)
+        if not len(values):
+            raise ValueError("Training rows contain no positive time gaps")
+        tau = float(np.median(values))
+        _save_chunk_progress(
+            progress_path,
+            corpus=corpus["fingerprint"],
+            seed=seed,
+            phase="statistics",
+            next_record=0,
+            tau=tau,
+            gap_sample_values=len(values),
+            positive_gaps_seen=seen,
+            counts=np.zeros(len(names), dtype=np.int64),
+            means=np.zeros(len(names), dtype=np.float64),
+            m2=np.zeros(len(names), dtype=np.float64),
+            covered_rows=0,
+        )
+        state = _load_chunk_progress(progress_path, corpus, seed)
+
+    tau = float(state["tau"])
+    counts = state["counts"].astype(np.int64, copy=True)
+    means = state["means"].astype(np.float64, copy=True)
+    m2 = state["m2"].astype(np.float64, copy=True)
+    covered_rows = int(state["covered_rows"])
+    _, _, protected = FeatureScale._prepare(np.zeros((1, len(names))), names, tau)
+    for index in range(int(state["next_record"]), len(records)):
+        record = records[index]
+        reader = ObservationReader(
+            root / record["path"], cache_bytes=int(record["max_chunk_bytes"])
+        )
+        if reader.manifest["fingerprint"] != record["source_fingerprint"]:
+            raise ValueError(f"Changed observation source: {record['id']}")
+        for batch_values in reader.iter_ranges(
+            history_ranges(record, history), ("x",), batch_rows=65536
+        ):
+            raw = batch_values["x"]
+            values, valid, protected = FeatureScale._prepare(raw, names, tau)
+            covered_rows += len(raw)
+            for column in range(len(names)):
+                present = values[valid[:, column], column]
+                n = len(present)
+                if not n:
+                    continue
+                batch_mean = float(present.mean())
+                centered = present - batch_mean
+                batch_m2 = float(np.sum(centered * centered))
+                total = int(counts[column]) + n
+                delta = batch_mean - means[column]
+                m2[column] += batch_m2 + delta * delta * counts[column] * n / total
+                means[column] += delta * n / total
+                counts[column] = total
+        _save_chunk_progress(
+            progress_path,
+            corpus=corpus["fingerprint"],
+            seed=seed,
+            phase="statistics",
+            next_record=index + 1,
+            tau=tau,
+            gap_sample_values=int(state["gap_sample_values"]),
+            positive_gaps_seen=int(state["positive_gaps_seen"]),
+            counts=counts,
+            means=means,
+            m2=m2,
+            covered_rows=covered_rows,
+        )
+        if progress:
+            progress(f"Training statistics pass {index + 1}/{len(records)}", flush=True)
+
+    std = np.sqrt(np.maximum(0, m2 / np.maximum(counts, 1)))
+    constant = (std == 0) & ~protected
+    means[protected] = 0
+    std[(std == 0) | protected] = 1
+    feature_scale = {
+        "names": list(names),
+        "mean": means.tolist(),
+        "scale": std.tolist(),
+        "constant": constant.tolist(),
+        "counts": counts.tolist(),
+        "time_delta_tau": tau,
+        "time_delta_method": "uniform random-priority reservoir median",
+        "time_delta_sample": int(state["gap_sample_values"]),
+        "positive_training_gaps": int(state["positive_gaps_seen"]),
+        "training_history_rows": covered_rows,
+    }
+
+    index = PairIndex(corpus, "train")
+    pair_ids = PairTraversal(index, seed).take(min(target_pairs, index.total))
+    ids, inverse = np.unique(
+        np.array([index.unrank(pair) for pair in pair_ids], dtype=np.int64).reshape(-1, 2),
+        axis=0,
+        return_inverse=True,
+    )
+    futures = np.empty((len(ids), horizon), dtype=np.float64)
+    for session in np.unique(ids[:, 0]):
+        record = index.records[int(session)]
+        reader = ObservationReader(
+            root / record["path"], cache_bytes=int(record["max_chunk_bytes"])
+        )
+        positions = np.flatnonzero(ids[:, 0] == session)
+        for offset in range(0, len(positions), 256):
+            take = positions[offset : offset + 256]
+            _, future = reader.episodes(ids[take, 1], history=history, horizon=horizon)
+            futures[take] = future
+        if progress:
+            progress(f"Target pass session {int(session) + 1}/{len(index.records)}", flush=True)
+    pairs = inverse.reshape(-1, 2)
+    raw = np.sqrt(np.mean((futures[pairs[:, 0]] - futures[pairs[:, 1]]) ** 2, axis=1))
+    target = TargetScale.fit(raw, seed)
+    halves = [
+        float(np.median(part[part > 0])) if np.any(part > 0) else None
+        for part in np.array_split(raw, 2)
+    ]
+    body = {
+        "version": 1,
+        "corpus": corpus["fingerprint"],
+        "features": feature_scale,
+        "target": {
+            "value": target.value,
+            "pair_count": target.pair_count,
+            "zero_fraction": target.zero_fraction,
+            "seed": seed,
+            "raw_quantiles": np.quantile(raw, [0, 0.25, 0.5, 0.75, 0.95, 1]).tolist(),
+            "half_positive_medians": halves,
+        },
+        "target_pair_ids": pair_ids.tolist(),
+        "traversal_version": PairTraversal.version,
+        "train_sources": fingerprint(records),
+    }
+    body["fingerprint"] = fingerprint(body)
+    write_json(output, body)
+    progress_path.unlink(missing_ok=True)
     return body
 
 

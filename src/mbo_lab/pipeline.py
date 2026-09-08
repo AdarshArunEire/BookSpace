@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from mbo_lab.abides import run_abides_export
-from mbo_lab.metrics.fixed import TargetScale, eligible_pairs, pair_targets, rms_distance
+from mbo_lab.metrics.fixed import TargetScale, future_pair_distances, future_path_rms, latent_l2
 from mbo_lab.observations import (
     FEATURE_SCHEMA_VERSION,
     TIME_OF_DAY_TIMEZONE,
@@ -19,7 +19,7 @@ from mbo_lab.observations import (
     load_observations,
 )
 from mbo_lab.paths import abides_paths, require_data_path
-from mbo_lab.samples import FeatureScale, batch, valid_anchors
+from mbo_lab.samples import FeatureScale, batch, eligible_pairs, valid_anchors
 
 
 @dataclass
@@ -105,9 +105,9 @@ def build_training_batch(
     feature_scale = FeatureScale.fit(observations, rows)
     transformed = replace(observations, x=feature_scale.transform(observations))
     X, Y = batch(transformed, anchors, history, horizon, stop=split)
-    D_raw = pair_targets(Y, pairs)
+    D_raw = future_pair_distances(Y, pairs)
     target_scale = TargetScale.fit(D_raw, seed=seed)
-    D = pair_targets(Y, pairs, target_scale)
+    D = future_pair_distances(Y, pairs, scale=target_scale)
     query_X, query_Y = batch(
         transformed,
         validation_anchors[:1],
@@ -115,7 +115,7 @@ def build_training_batch(
         horizon,
         start=split,
     )
-    distances = rms_distance(
+    distances = latent_l2(
         X.reshape(len(X), -1),
         np.broadcast_to(query_X.reshape(1, -1), (len(X), X[0].size)),
     )
@@ -164,7 +164,7 @@ def build_training_batch(
         "pair_policy": "uniform anchor sample; unique pairs with disjoint complete episodes",
         "query_anchor": int(validation_anchors[0]),
         "nearest_anchor": int(anchors[nearest]),
-        "forecast_path_rms_error": float(rms_distance(Y[nearest], query_Y[0])),
+        "forecast_path_rms_error": float(future_path_rms(Y[nearest], query_Y[0])),
         "purpose": "Full-schema pipeline smoke run; no encoder training or real-market claim",
     }
     return TrainingBatch(

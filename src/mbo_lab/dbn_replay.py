@@ -3,10 +3,10 @@
 import csv
 import tempfile
 import time
+from bisect import bisect_left, insort
 from collections import Counter
 from importlib.metadata import version
 from pathlib import Path
-from bisect import bisect_left, insort
 
 import databento_dbn as dbn
 import zstandard as zstd
@@ -265,7 +265,8 @@ def export_replay(
         state = summarize_book(book, 10)
         for side, name in (("BUY", "bids"), ("SELL", "asks")):
             expected = [
-                (p, *expected_levels [side][p]) for p in sorted(expected_levels [side], reverse=side == "BUY")[:10]
+                (price, *expected_levels[side][price])
+                for price in sorted(expected_levels[side], reverse=side == "BUY")[:10]
             ]
             actual = [(float(v["price"]), float(v["size"]), v["orders"]) for v in state[name]]
             if actual != expected:

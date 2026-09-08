@@ -5,6 +5,16 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def eligible_pairs(anchors, history=256, horizon=128):
+    """Return unique, non-overlapping unordered pairs of anchor positions."""
+    anchors = np.asarray(anchors, dtype=np.int64)
+    if anchors.ndim != 1 or history < 1 or horizon < 1:
+        raise ValueError("Invalid anchors/window lengths")
+    i, j = np.triu_indices(len(anchors), k=1)
+    keep = np.abs(anchors[i] - anchors[j]) >= history + horizon
+    return np.column_stack((i[keep], j[keep]))
+
+
 def valid_anchors(observations, history=256, horizon=128, start=0, stop=None):
     """Restrict complete episodes to the half-open split [start, stop)."""
     stop = len(observations.mid) if stop is None else stop
