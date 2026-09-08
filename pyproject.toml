@@ -26,6 +26,7 @@ dev = [
     "nbclient>=0.10",
     "ruff>=0.12",
     "matplotlib>=3.11.1",
+    "line-profiler>=5.0.2",
 ]
 
 [tool.hatch.build.targets.wheel]

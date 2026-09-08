@@ -7,7 +7,7 @@ import json
 import math
 import tomllib
 from collections import Counter
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import version
 from pathlib import Path
@@ -16,15 +16,11 @@ from typing import Iterator
 import databento as db
 import databento_dbn as dbn
 import zstandard as zstd
+from databento import Compression
 from nautilus_trader.adapters.databento.loaders import DatabentoDataLoader
 from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.enums import BookType
-
-from databento import Compression
-
-from mbo_lab.budget import complete, reserve, status
-
 
 
 class DataError(ValueError):
@@ -74,7 +70,9 @@ class Request:
         if end <= start:
             raise DataError("Choose a positive interval")
         if start.time().isoformat() != "00:00:00":
-            raise DataError("Start at 00:00:00Z so the range can be partitioned at book reset boundaries")
+            raise DataError(
+                "Start at 00:00:00Z so the range can be partitioned at book reset boundaries"
+            )
         object.__setattr__(self, "start", _iso_utc(start))
         object.__setattr__(self, "end", _iso_utc(end))
 
@@ -101,7 +99,6 @@ def discover(dataset: str = "GLBX.MDP3", *, client=None) -> dict:
         "range": client.metadata.get_dataset_range(dataset=dataset),
         "publishers": client.metadata.list_publishers(),
     }
-
 
 
 def _mapping_intervals(request: Request, *, client) -> list[tuple[datetime, datetime, str]]:
@@ -176,7 +173,9 @@ def plan(request: Request, *, client=None) -> list[Request]:
                     start=_iso_utc(chunk_start),
                     end=_iso_utc(chunk_end),
                     dataset=request.dataset,
-                    stype_in="instrument_id" if request.stype_in == "continuous" else request.stype_in,
+                    stype_in="instrument_id"
+                    if request.stype_in == "continuous"
+                    else request.stype_in,
                 )
             )
     if not chunks:
@@ -192,27 +191,32 @@ def resolve(request: Request, *, client) -> Request:
     return chunks[0]
 
 
-def _estimate_one(request: Request, *, client) -> dict:
+def estimate(request: Request, *, client=None, mode="historical") -> dict:
+    """Quote the whole range; Databento resolves continuous symbols server-side."""
+    client = client if client is not None else db.Historical()
     costs = {
         schema: float(client.metadata.get_cost(**_parameters(request, schema)))
         for schema in ("definition", "mbo")
     }
     if any(not math.isfinite(cost) or cost < 0 for cost in costs.values()):
         raise DataError("Provider returned an invalid cost estimate")
-    return {"request": asdict(request), "usd": costs, "total_usd": sum(costs.values())}
-
-
-def estimate(request: Request, *, client=None) -> dict:
-    client = client if client is not None else db.Historical()
-    quotes = [_estimate_one(chunk, client=client) for chunk in plan(request, client=client)]
-    costs = {
-        schema: sum(quote["usd"][schema] for quote in quotes)
+    sizes = {
+        schema: client.metadata.get_billable_size(**_parameters(request, schema))
         for schema in ("definition", "mbo")
     }
+    if any(not isinstance(size, int) or size < 0 for size in sizes.values()):
+        raise DataError("Provider returned an invalid billable size")
+    prices = client.metadata.list_unit_prices(dataset=request.dataset)
+    rates = next(
+        (item["unit_prices"] for item in prices if item["mode"] == mode),
+        {},
+    )
     return {
         "request": asdict(request),
-        "chunks": quotes,
+        "mode": mode,
         "usd": costs,
+        "billable_bytes": sizes,
+        "usd_per_gb": {schema: rates.get(schema) for schema in costs},
         "total_usd": sum(costs.values()),
     }
 
@@ -220,7 +224,7 @@ def estimate(request: Request, *, client=None) -> dict:
 def _records(path: str | Path) -> Iterator:
     """Use SDK decoding, but also require complete Zstandard frames and DBN records."""
     path = Path(path)
-    decoder = dbn.DBNDecoder(compression=Compression.NONE) # type: ignore # dbn.Compression.from_int(0) is the same but pylance won't be angry
+    decoder = dbn.DBNDecoder(compression=Compression.NONE)  # type: ignore # dbn.Compression.from_int(0) is the same but pylance won't be angry
     decompressor = None
     try:
         with path.open("rb") as stream:
@@ -240,8 +244,7 @@ def _records(path: str | Path) -> Iterator:
                         decoded, chunk = chunk, b""
                     decoder.write(decoded)
                     yield from decoder.decode()
-            assert decompressor is not None
-            if compressed and not decompressor.eof:
+            if compressed and decompressor is not None and not decompressor.eof:
                 raise DataError(f"Truncated Zstandard frame: {path}")
             if decoder.buffer():
                 raise DataError(f"Truncated DBN metadata or record: {path}")
@@ -403,11 +406,34 @@ def summarize_book(book: OrderBook, depth: int = 10) -> dict:
         "asks": levels(book.asks()),
     }
 
+def top_levels_fast(book: OrderBook, depth: int = 10):
+    if depth < 1:
+        raise DataError("Depth must be positive")
+
+    bids = [
+        (
+            level.price.as_double(),
+            level.size(),
+            level.len(),
+        )
+        for level in book.bids(depth)
+    ]
+
+    asks = [
+        (
+            level.price.as_double(),
+            level.size(),
+            level.len(),
+        )
+        for level in book.asks(depth)
+    ]
+
+    return bids, asks
+
 
 def _sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
-
 
 
 def _cache_locations(request: Request, directory: Path):
@@ -424,7 +450,9 @@ def _cached_chunk(request: Request, directory: Path):
             path.exists() or path.with_suffix(path.suffix + ".part").exists()
             for path in paths.values()
         ):
-            raise DataError("Unfinished download exists; inspect/remove it explicitly before retrying")
+            raise DataError(
+                "Unfinished download exists; inspect/remove it explicitly before retrying"
+            )
         return None
     try:
         manifest = json.loads(manifest_path.read_text())
@@ -444,9 +472,7 @@ def _download_chunk(
     request: Request,
     directory: Path,
     *,
-    quote: dict,
     client,
-    budget_path,
 ) -> dict:
     cached = _cached_chunk(request, directory)
     if cached is not None:
@@ -455,7 +481,6 @@ def _download_chunk(
     manifest_path, paths = _cache_locations(request, directory)
     directory.mkdir(parents=True, exist_ok=True)
     partials = {schema: path.with_suffix(path.suffix + ".part") for schema, path in paths.items()}
-    reservation = reserve(quote["total_usd"], asdict(request), budget_path)
 
     for schema, path in partials.items():
         client.timeseries.get_range(**_parameters(request, schema), path=path)
@@ -472,8 +497,6 @@ def _download_chunk(
     manifest = {
         "request": asdict(request),
         "synthetic": any(symbol.startswith("SYNTH_") for symbol in definitions["symbols"]),
-        "estimate": quote,
-        "budget_reservation": reservation,
         "sha256": {schema: _sha256(path) for schema, path in partials.items()},
         "versions": {name: version(name) for name in ("databento", "nautilus_trader")},
     }
@@ -482,7 +505,6 @@ def _download_chunk(
     temporary = manifest_path.with_suffix(".json.part")
     temporary.write_text(json.dumps(manifest, indent=2) + "\n")
     temporary.replace(manifest_path)
-    complete(reservation, manifest_path=manifest_path)
     return {"cached": False, "paths": paths, "manifest_path": manifest_path, "manifest": manifest}
 
 
@@ -535,76 +557,40 @@ def _load_range_cache(request: Request, directory: Path):
         raise
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise DataError(f"Invalid range manifest: {path}") from exc
-    return {"cached": True, "range_manifest_path": path, "range_manifest": manifest, "chunks": chunks}
+    return {
+        "cached": True,
+        "range_manifest_path": path,
+        "range_manifest": manifest,
+        "chunks": chunks,
+    }
 
 
 def download(
-    request: Request, directory: str | Path, *, max_cost: float, client=None, budget_path=None,
-    confirm=None,
+    request: Request,
+    directory: str | Path,
+    *,
+    client=None,
+    progress=None,
 ) -> dict:
     """Download a range safely; multi-day requests fan out into cached single-instrument chunks."""
-    if not math.isfinite(max_cost) or max_cost < 0:
-        raise DataError("max_cost must be a finite, nonnegative USD amount")
     directory = Path(directory)
 
     cached_range = _load_range_cache(request, directory)
     if cached_range is not None:
         return cached_range
 
-    budget = status(budget_path)
-    if budget["expired"]:
-        raise DataError("Local credit budget expired; verify your Databento billing page")
     client = client if client is not None else db.Historical()
 
     chunks = plan(request, client=client)
-    quotes = []
-    cached_results = {}
-    for chunk in chunks:
-        cached = _cached_chunk(chunk, directory)
-        key = json.dumps(asdict(chunk), sort_keys=True)
-        if cached is not None:
-            cached_results[key] = cached
-        else:
-            quotes.append(_estimate_one(chunk, client=client))
-
-    costs = {
-        schema: sum(quote["usd"][schema] for quote in quotes)
-        for schema in ("definition", "mbo")
-    }
-    quote = {
-        "request": asdict(request),
-        "planned_chunks": len(chunks),
-        "cached_chunks": len(cached_results),
-        "download_chunks": len(quotes),
-        "chunks": quotes,
-        "usd": costs,
-        "total_usd": sum(costs.values()),
-    }
-
-    if quote["total_usd"] > max_cost:
-        raise DataError(f"Estimated ${quote['total_usd']:.6f} exceeds maximum ${max_cost:.6f}")
-    if quote["total_usd"] > float(budget["remaining_usd"]):
-        raise DataError("Estimate exceeds cumulative remaining budget")
-    if quotes and (confirm is None or confirm({"quote": quote, "budget": budget}) is not True):
-        raise DataError("Download not confirmed; no new data requested or budget reserved")
-
-    quotes_by_request = {
-        json.dumps(item["request"], sort_keys=True): item
-        for item in quotes
-    }
     results = []
-    for chunk in chunks:
-        key = json.dumps(asdict(chunk), sort_keys=True)
-        if key in cached_results:
-            results.append(cached_results[key])
-            continue
+    for index, chunk in enumerate(chunks, 1):
+        if progress is not None:
+            progress(index, len(chunks), chunk)
         results.append(
             _download_chunk(
                 chunk,
                 directory,
-                quote=quotes_by_request[key],
                 client=client,
-                budget_path=budget_path,
             )
         )
 
@@ -617,7 +603,6 @@ def download(
             }
             for chunk, result in zip(chunks, results)
         ],
-        "estimate_for_new_data": quote,
     }
     range_path = _range_manifest_path(request, directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -630,4 +615,3 @@ def download(
         "range_manifest": range_manifest,
         "chunks": results,
     }
-

@@ -32,12 +32,16 @@ from mbo_lab.observations import (  # noqa: E402
 from mbo_lab.paths import abides_paths, require_data_path  # noqa: E402
 
 
-def run(output=None, seed=0, end_time="10:00:00"):
+def run(output=None, seed=0, end_time="10:00:00", date="2021-02-05", progress_seconds=5):
+    if not np.isfinite(progress_seconds) or progress_seconds <= 0:
+        raise ValueError("progress_seconds must be finite and positive")
+    print(f"ABIDES: preparing session {date}, 09:30:00 to {end_time}", flush=True)
     output = require_data_path(output or abides_paths(seed, end_time)[0])
     output.mkdir(parents=True, exist_ok=True)
     names = feature_names()
     parameters = dict(
         seed=seed,
+        date=date,
         end_time=end_time,
         log_orders=False,
         exchange_log_orders=False,
@@ -51,10 +55,26 @@ def run(output=None, seed=0, end_time="10:00:00"):
     counts = Counter()
     previous_mid = previous_time = None
     segment = 0
+    last_progress = time.perf_counter()
 
     def record(current_time, sender_id, message):
-        nonlocal previous_mid, previous_time, segment
+        nonlocal previous_mid, previous_time, segment, last_progress
         original(current_time, sender_id, message)
+        now = time.perf_counter()
+        if now - last_progress >= progress_seconds:
+            seconds = int(current_time // 1_000_000_000) % 86400
+            hour, remainder = divmod(seconds, 3600)
+            minute, second = divmod(remainder, 60)
+            fraction = (current_time - exchange.mkt_open) / (
+                exchange.mkt_close - exchange.mkt_open
+            )
+            percent = max(0, min(100, fraction * 100))
+            print(
+                f"ABIDES: sim {hour:02}:{minute:02}:{second:02} | {percent:.1f}% of session"
+                f" | {len(rows):,} rows | {now - started:.0f}s elapsed",
+                flush=True,
+            )
+            last_progress = now
         if (
             not isinstance(message, OrderMsg)
             or not exchange.mkt_open <= current_time <= exchange.mkt_close
@@ -104,8 +124,10 @@ def run(output=None, seed=0, end_time="10:00:00"):
 
     exchange.receive_message = record
     started = time.perf_counter()
+    print("ABIDES: simulating", flush=True)
     with patch("socket.socket.connect", side_effect=RuntimeError("Simulation must stay offline")):
         abides.run(config, log_dir=str((output / "logs").resolve()), kernel_seed=seed)
+    print(f"ABIDES: simulation finished; saving {len(rows):,} rows", flush=True)
     observations = Observations(
         np.asarray(rows, dtype=float).reshape(-1, len(names)),
         np.asarray(mids),
@@ -159,6 +181,7 @@ def run(output=None, seed=0, end_time="10:00:00"):
         "elapsed_seconds": time.perf_counter() - started,
     }
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
+    print(f"ABIDES: saved {len(rows):,} rows to {output}", flush=True)
     print(
         json.dumps(
             {
@@ -177,5 +200,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, help="Override simulated observation directory")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--end-time", default="10:00:00")
+    parser.add_argument("--date", default="2021-02-05")
+    parser.add_argument("--progress-seconds", type=float, default=5)
     args = parser.parse_args()
-    run(args.output, args.seed, args.end_time)
+    run(args.output, args.seed, args.end_time, args.date, args.progress_seconds)

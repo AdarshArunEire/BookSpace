@@ -16,10 +16,10 @@ Databento receive timestamps are converted from UTC.
 From BookSpace in PowerShell:
 
 ```powershell
-py -m uv sync --locked
-py -m uv run python scripts/setup_abides.py
-py -m uv run python -m jupyterlab notebooks/abides_pipeline.ipynb
-py -m uv run python -m unittest discover -s tests -p test_samples.py -v
+uv sync --locked
+uv run python scripts/setup_abides.py
+uv run python -m jupyterlab notebooks/abides_pipeline.ipynb
+uv run python -m unittest discover -s tests -p test_samples.py -v
 ```
 
 Setup is needed once. It downloads ABIDES commit
@@ -30,14 +30,21 @@ agent strategies and the upstream order-size model are unchanged. Sources load
 directly from the pinned checkout. Dependencies are pinned in
 `scripts/abides-requirements.txt`.
 
-The notebook's smoke cell runs from 09:30 to 10:00 in a synthetic session. To
-extend it or change the seed, edit the full-generation parameter cell and set
-`RUN_FULL = True`. To reuse an existing exported source, set
-`USE_EXISTING_SOURCE = True` instead. The compatibility wrapper remains useful
+The notebook has two independent run cells. Smoke runs 09:30–10:00. Generation
+exposes `sessions` and `seed`, and saves every observation from each 09:30–16:00
+session. Each starts a fresh market with a deterministic session seed. Dates are
+internal timestamp labels and do not select historical market conditions.
+Completed daily exports are verified and reused on rerun; a dataset manifest
+records progress. Generation holds at most one day's observations at a time.
+While exchange events advance, notebook output reports simulated time, session
+percentage, collected rows, and wall time roughly every five seconds. Setup,
+saving, and completion are reported separately. Percentage measures simulated
+session time, not estimated runtime. A stalled exchange produces no fresh progress.
+There is no 512-anchor cap on this data. The compatibility wrapper remains useful
 for automation:
 
 ```powershell
-py -m uv run python scripts/training_smoke.py --end-time 11:00:00 --seed 1
+uv run python scripts/training_smoke.py --end-time 11:00:00 --seed 1
 ```
 
 Every smoke run executes ABIDES -> x and one-step y -> chronological 256-row X and
@@ -73,8 +80,9 @@ clock and are labelled `simulation`. One row is a completed exchange order reque
 including no-ops; it is not a Databento F_LAST event. Simulator-internal hidden
 orders and latent fundamental values are excluded from x.
 
-These runs test the pipeline, not real-market forecasting performance. Large-scale
-streaming and multi-session generation are not implemented yet. The previous
+These runs test the pipeline, not real-market forecasting performance. Multi-session
+generation saves separate daily sources; shared preprocessing and training batches
+across days remain separate work. Within-session streaming is not implemented. The previous
 synthetic DBN fixtures, array generators and their notebooks/plots were removed.
 Tests execute ABIDES and check the full schema. The removed DBN regression notebook
 no longer provides decoder coverage; ABIDES tests do not replace that coverage.
